@@ -195,6 +195,112 @@ pub(super) async fn fetch_and_authorize_sandbox(
 /// Resolve a public sandbox name and authorize its persisted workspace.
 /// Missing and unauthorized objects deliberately share one response so names
 /// cannot be used as an existence oracle.
+/// Rejects a change to `sandbox` from anyone but the manager recorded on it,
+/// when its workspace has managers. `emergency` allows operators and admins
+/// to stop or delete it.
+pub(super) fn require_recorded_manager(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    sandbox: &Sandbox,
+    emergency: bool,
+) -> Result<(), Status> {
+    require_object_manager(
+        state,
+        principal,
+        sandbox.object_workspace(),
+        sandbox.metadata.as_ref(),
+        emergency,
+    )
+}
+
+/// Rejects a change to an object in `workspace` from anyone but the manager
+/// recorded in its `metadata`, when the workspace has managers.
+pub(super) fn require_object_manager(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    workspace: &str,
+    metadata: Option<&ObjectMeta>,
+    emergency: bool,
+) -> Result<(), Status> {
+    use crate::auth::workspace_managers::{
+        MANAGER_ANNOTATION, NOT_THE_RECORDED_MANAGER, WorkspaceManagers,
+    };
+    let managers = WorkspaceManagers::new(
+        state.config.workspace_managers.clone(),
+        state.admin_role.clone(),
+    );
+    let recorded = metadata
+        .and_then(|metadata| metadata.annotations.get(MANAGER_ANNOTATION))
+        .map(String::as_str);
+    if managers.permits_object(principal, workspace, recorded, emergency) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(NOT_THE_RECORDED_MANAGER))
+    }
+}
+
+/// Rejects creating objects in `workspace` from anyone but its managers,
+/// when it has them.
+pub(super) fn require_workspace_manager(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    workspace: &str,
+) -> Result<(), Status> {
+    use crate::auth::workspace_managers::{NOT_A_MANAGER, WorkspaceManagers};
+    let managers = WorkspaceManagers::new(
+        state.config.workspace_managers.clone(),
+        state.admin_role.clone(),
+    );
+    if managers.permits_changes(principal, workspace) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(NOT_A_MANAGER))
+    }
+}
+
+/// Canonical managers list for `workspace`, recorded on each new object.
+pub(super) fn managers_in_effect(state: &ServerState, workspace: &str) -> String {
+    crate::auth::workspace_managers::canonical(
+        state
+            .config
+            .workspace_managers
+            .get(workspace)
+            .map_or(&[][..], Vec::as_slice),
+    )
+}
+
+/// [`resolve_and_authorize_sandbox_name`] for a change only the sandbox's
+/// recorded manager may make.
+pub(super) async fn resolve_and_authorize_sandbox_change(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    sandbox_name: &str,
+    workspace: &str,
+    min_role: MinWorkspaceRole,
+) -> Result<Sandbox, Status> {
+    let sandbox =
+        resolve_and_authorize_sandbox_name(state, principal, sandbox_name, workspace, min_role)
+            .await?;
+    require_recorded_manager(state, principal, &sandbox, false)?;
+    Ok(sandbox)
+}
+
+/// [`resolve_and_authorize_sandbox_change`] for an emergency stop, which
+/// operators and admins may also make.
+pub(super) async fn resolve_and_authorize_sandbox_stop(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    sandbox_name: &str,
+    workspace: &str,
+    min_role: MinWorkspaceRole,
+) -> Result<Sandbox, Status> {
+    let sandbox =
+        resolve_and_authorize_sandbox_name(state, principal, sandbox_name, workspace, min_role)
+            .await?;
+    require_recorded_manager(state, principal, &sandbox, true)?;
+    Ok(sandbox)
+}
+
 pub(super) async fn resolve_and_authorize_sandbox_name(
     state: &ServerState,
     principal: &crate::auth::principal::Principal,
@@ -325,7 +431,7 @@ pub(super) async fn handle_update_sandbox(
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
     validate_image_update_request(&request)?;
-    let sandbox = resolve_and_authorize_sandbox_name(
+    let sandbox = resolve_and_authorize_sandbox_change(
         state,
         &principal,
         &request.name,
@@ -436,6 +542,7 @@ pub(super) async fn handle_begin_rootfs_tar_staging(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .ensure_active()?;
+    require_workspace_manager(state, &principal, &workspace)?;
 
     let subject = principal_subject(&principal)?;
     let slot = state.compute.rootfs_tar_staging().begin(
@@ -578,6 +685,8 @@ async fn handle_create_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .ensure_active()?;
+    require_workspace_manager(state, &principal, &workspace)?;
+    let managers_in_effect = managers_in_effect(state, &workspace);
 
     let (mut spec, created_from_workload_template) = if workload_template_name.is_empty() {
         let spec = request
@@ -586,12 +695,9 @@ async fn handle_create_sandbox_inner(
         (spec, None)
     } else {
         let governance_spec = request.spec.unwrap_or_default();
-        let template = state
-            .store
-            .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+        let template =
+            resolve_workload_template(state.store.as_ref(), &workspace, &workload_template_name)
+                .await?;
         let provenance = SandboxWorkloadTemplateProvenance {
             name: template.object_name().to_string(),
             resource_version: template.get_resource_version().to_string(),
@@ -796,6 +902,14 @@ async fn handle_create_sandbox_inner(
         .map_err(|error| Status::internal(error.to_string()))?;
     if let Some(metadata) = sandbox.metadata.as_mut() {
         runtime_identity.write(&mut metadata.annotations);
+        // Record the creator, so only it can change the sandbox in a workspace
+        // with managers, and the list in effect, so the gateway can refuse to
+        // start if the workspace's list later changes.
+        crate::auth::workspace_managers::stamp(
+            &mut metadata.annotations,
+            &principal,
+            managers_in_effect,
+        );
     }
     let launch_authentication = if let Some(authority) = &state.sandbox_session_jwt_authority {
         Some(authority.mint_persisted_launch(&id, &runtime_identity)?)
@@ -963,6 +1077,64 @@ fn validate_template_create_governance_spec(spec: &SandboxSpec) -> Result<(), St
         ));
     }
     Ok(())
+}
+
+/// Label naming the template family that a revision belongs to.
+const TEMPLATE_FAMILY_LABEL: &str = "openshell.ai/template-family";
+/// Label holding a revision's generation within its family, as a decimal integer.
+const TEMPLATE_GENERATION_LABEL: &str = "openshell.ai/template-generation";
+/// Upper bound on revisions considered when resolving a family name.
+const MAX_TEMPLATE_REVISIONS: u32 = 1000;
+
+/// Resolve a workload template by name.
+///
+/// An exact template name wins. Otherwise the name is treated as a template
+/// family, and the revision with the highest generation label is used. This
+/// lets callers such as session execution layers name a template whose
+/// declared owner, such as the Kubernetes controller, publishes immutable
+/// revisions. The sandbox records the resolved revision as its provenance.
+async fn resolve_workload_template(
+    store: &crate::persistence::Store,
+    workspace: &str,
+    name: &str,
+) -> Result<SandboxWorkloadTemplate, Status> {
+    if let Some(template) = store
+        .get_message_by_name::<SandboxWorkloadTemplate>(workspace, name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
+    {
+        return Ok(template);
+    }
+    let revisions = store
+        .list_messages_with_selector::<SandboxWorkloadTemplate>(
+            workspace,
+            &format!("{TEMPLATE_FAMILY_LABEL}={name}"),
+            MAX_TEMPLATE_REVISIONS,
+            0,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("list sandbox templates failed: {e}")))?;
+    latest_template_revision(revisions)
+        .ok_or_else(|| Status::not_found("sandbox template not found"))
+}
+
+/// The revision with the highest generation label. Revisions without a valid
+/// generation are ignored.
+fn latest_template_revision(
+    revisions: Vec<SandboxWorkloadTemplate>,
+) -> Option<SandboxWorkloadTemplate> {
+    revisions
+        .into_iter()
+        .filter_map(|template| {
+            let generation = template
+                .object_labels()?
+                .get(TEMPLATE_GENERATION_LABEL)?
+                .parse::<u64>()
+                .ok()?;
+            Some((generation, template))
+        })
+        .max_by_key(|(generation, _)| *generation)
+        .map(|(_, template)| template)
 }
 
 fn sandbox_spec_from_stored_workload_template(
@@ -1169,6 +1341,13 @@ pub(super) async fn handle_create_sandbox_template(
             "template.metadata.name is required",
         ));
     }
+    require_workspace_manager(state, &principal, &workspace)?;
+    let mut annotations = metadata.annotations;
+    crate::auth::workspace_managers::stamp(
+        &mut annotations,
+        &principal,
+        managers_in_effect(state, &workspace),
+    );
 
     let mut resolved = template;
     resolved.metadata = Some(ObjectMeta {
@@ -1177,7 +1356,7 @@ pub(super) async fn handle_create_sandbox_template(
         created_time: openshell_core::time::timestamp_from_millis(current_time_ms()).ok(),
         labels: metadata.labels,
         resource_version: 0,
-        annotations: metadata.annotations,
+        annotations,
         workspace: workspace.clone(),
         deletion_time: None,
     });
@@ -1341,6 +1520,22 @@ pub(super) async fn handle_delete_sandbox_template(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    // Only the template's recorded manager may delete it. A missing template
+    // falls through to the usual not-found handling.
+    if let Some(template) = state
+        .store
+        .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
+    {
+        require_object_manager(
+            state,
+            &principal,
+            &workspace,
+            template.metadata.as_ref(),
+            false,
+        )?;
+    }
     let deleted = state
         .store
         .delete_by_name(
@@ -1477,7 +1672,7 @@ pub(super) async fn handle_attach_sandbox_provider(
         .get::<Arc<tokio::sync::Notify>>()
         .cloned();
     let request = request.into_inner();
-    let sandbox = resolve_and_authorize_sandbox_name(
+    let sandbox = resolve_and_authorize_sandbox_change(
         state,
         &principal,
         &request.sandbox,
@@ -1670,7 +1865,7 @@ pub(super) async fn handle_detach_sandbox_provider(
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let request = request.into_inner();
-    let sandbox = resolve_and_authorize_sandbox_name(
+    let sandbox = resolve_and_authorize_sandbox_change(
         state,
         &principal,
         &request.sandbox,
@@ -1837,10 +2032,24 @@ async fn handle_delete_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    // Only the recorded manager, or an operator or admin in an emergency, may
+    // delete. A missing sandbox falls through to the usual not-found handling.
     // Main's canonical public delete request contains no caller-provided
     // identity/version fields. The compute layer still binds the resolved
     // object ID and lifecycle guards before committing deletion.
-    let preconditions = SandboxDeletePreconditions::default();
+    let mut preconditions = SandboxDeletePreconditions::default();
+    if let Some(sandbox) = state
+        .store
+        .get_message_by_name::<Sandbox>(&workspace, &name)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+    {
+        require_recorded_manager(state, &principal, &sandbox, true)?;
+        if state.config.workspace_managers.contains_key(&workspace) {
+            // Delete the sandbox whose manager was checked, never a replacement.
+            preconditions.expected_sandbox_id = Some(sandbox.object_id().to_string());
+        }
+    }
     let result = state
         .compute
         .delete_sandbox_allow_missing_with_preconditions(
@@ -1883,7 +2092,7 @@ async fn handle_stop_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let resolved = resolve_and_authorize_sandbox_name(
+    let resolved = resolve_and_authorize_sandbox_stop(
         state,
         &principal,
         &req.name,
@@ -1926,7 +2135,7 @@ async fn handle_start_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let resolved = resolve_and_authorize_sandbox_name(
+    let resolved = resolve_and_authorize_sandbox_change(
         state,
         &principal,
         &req.name,
@@ -1986,7 +2195,7 @@ async fn handle_suspend_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let resolved = resolve_and_authorize_sandbox_name(
+    let resolved = resolve_and_authorize_sandbox_change(
         state,
         &principal,
         &req.name,
@@ -2029,7 +2238,7 @@ async fn handle_resume_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let resolved = resolve_and_authorize_sandbox_name(
+    let resolved = resolve_and_authorize_sandbox_change(
         state,
         &principal,
         &req.name,
@@ -8026,6 +8235,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sandbox_records_its_manager() {
+        let state = test_server_state().await;
+
+        let created = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                request_id: String::new(),
+                name: "managed".to_string(),
+                spec: Some(SandboxSpec::default()),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                await_main_process_attachment: false,
+                workload_template: String::new(),
+                service_exposures: Vec::new(),
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+
+        assert_eq!(
+            created.metadata.as_ref().and_then(|metadata| metadata
+                .annotations
+                .get(crate::auth::workspace_managers::MANAGER_ANNOTATION)),
+            Some(&"oidc:dev-user".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_managers_apply_only_to_their_workspace() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("unique state")
+            .config
+            .workspace_managers = std::collections::BTreeMap::from([(
+            "agents".to_string(),
+            vec!["mtls:openshell-k8s-controller".to_string()],
+        )]);
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(openshell_core::proto::CreateWorkspaceRequest {
+                request_id: String::new(),
+                name: "agents".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("agents workspace should be created");
+        let create = |workspace: &str| CreateSandboxRequest {
+            request_id: String::new(),
+            name: String::new(),
+            spec: Some(SandboxSpec::default()),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+            await_main_process_attachment: false,
+            workload_template: String::new(),
+            service_exposures: Vec::new(),
+        };
+
+        // oidc:dev-user isn't a manager of agents, so it can't provision there.
+        let denied = handle_create_sandbox(&state, authed_request(create("agents")))
+            .await
+            .expect_err("a non-manager can't provision in a managed workspace");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            denied.message(),
+            crate::auth::workspace_managers::NOT_A_MANAGER
+        );
+
+        // Other workspaces on the same gateway keep the default behavior.
+        let created = handle_create_sandbox(&state, authed_request(create("default")))
+            .await
+            .expect("an unmanaged workspace allows any authorized caller")
+            .into_inner()
+            .sandbox
+            .expect("created sandbox");
+        assert_eq!(
+            created.metadata.as_ref().and_then(|metadata| metadata
+                .annotations
+                .get(crate::auth::workspace_managers::MANAGERS_CONFIG_ANNOTATION)),
+            Some(&"[]".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_recorded_manager_or_an_admin_deletes_a_sandbox() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+
+        fn request<T>(principal: Principal, inner: T) -> Request<T> {
+            let mut request = Request::new(inner);
+            request.extensions_mut().insert(principal);
+            request
+        }
+
+        let mut state = test_server_state().await;
+        {
+            let state = Arc::get_mut(&mut state).expect("unique state");
+            state.config.workspace_managers = std::collections::BTreeMap::from([(
+                "default".to_string(),
+                vec!["mtls:cluster-a".into(), "mtls:cluster-b".into()],
+            )]);
+            state.admin_role = "openshell-admin".into();
+        }
+        let as_principal = |cn: &str, roles: &[&str]| {
+            Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: cn.to_string(),
+                    display_name: None,
+                    roles: roles.iter().map(ToString::to_string).collect(),
+                    scopes: vec![],
+                    provider: IdentityProvider::Mtls,
+                },
+            })
+        };
+        let delete = || DeleteSandboxRequest {
+            name: "managed".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            allow_missing: false,
+            request_id: String::new(),
+        };
+
+        let created = handle_create_sandbox(
+            &state,
+            request(
+                as_principal("cluster-a", &["openshell-admin"]),
+                CreateSandboxRequest {
+                    request_id: String::new(),
+                    name: "managed".to_string(),
+                    spec: Some(SandboxSpec::default()),
+                    labels: HashMap::new(),
+                    annotations: HashMap::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    await_main_process_attachment: false,
+                    workload_template: String::new(),
+                    service_exposures: Vec::new(),
+                },
+            ),
+        )
+        .await
+        .expect("create")
+        .into_inner()
+        .sandbox
+        .expect("created sandbox");
+        let annotations = &created.metadata.as_ref().unwrap().annotations;
+        assert_eq!(
+            annotations
+                .get(crate::auth::workspace_managers::MANAGERS_CONFIG_ANNOTATION)
+                .map(String::as_str),
+            Some(r#"["mtls:cluster-a","mtls:cluster-b"]"#)
+        );
+
+        // Another listed manager, a workspace member without the admin role,
+        // can't delete it.
+        state
+            .store
+            .put_message(&openshell_core::proto::WorkspaceMember {
+                metadata: Some(ObjectMeta {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: "cluster-b".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                principal_subject: "cluster-b".to_string(),
+                role: openshell_core::proto::WorkspaceRole::Admin.into(),
+            })
+            .await
+            .expect("add member");
+        let err = handle_delete_sandbox(
+            &state,
+            request(as_principal("cluster-b", &["openshell-user"]), delete()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "managed")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // An admin can, as an emergency.
+        handle_delete_sandbox(
+            &state,
+            request(as_principal("oncall", &["openshell-admin"]), delete()),
+        )
+        .await
+        .expect("emergency delete");
+    }
+
+    #[tokio::test]
     async fn create_sandbox_rejects_reserved_annotations() {
         let state = test_server_state().await;
 
@@ -8561,6 +8974,81 @@ mod tests {
         );
     }
 
+    fn managed_request<T>(cn: &str, inner: T) -> Request<T> {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+        let mut request = Request::new(inner);
+        request
+            .extensions_mut()
+            .insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: cn.to_string(),
+                    display_name: None,
+                    roles: vec!["openshell-admin".to_string()],
+                    scopes: vec![],
+                    provider: IdentityProvider::Mtls,
+                },
+            }));
+        request
+    }
+    #[tokio::test]
+    async fn only_the_recorded_manager_changes_a_workload_template() {
+        let mut state = test_server_state().await;
+        Arc::get_mut(&mut state)
+            .expect("unique state")
+            .config
+            .workspace_managers = std::collections::BTreeMap::from([(
+            "default".to_string(),
+            vec!["mtls:cluster-a".into(), "mtls:cluster-b".into()],
+        )]);
+        let create = || CreateSandboxTemplateRequest {
+            request_id: String::new(),
+            template: Some(test_workload_template("base-r1")),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+        };
+        let delete = || DeleteSandboxTemplateRequest {
+            name: "base-r1".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            allow_missing: false,
+            ..Default::default()
+        };
+
+        let denied = handle_create_sandbox_template(&state, authed_request(create()))
+            .await
+            .expect_err("a non-manager can't create templates in a managed workspace");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            denied.message(),
+            crate::auth::workspace_managers::NOT_A_MANAGER
+        );
+
+        let created =
+            handle_create_sandbox_template(&state, managed_request("cluster-a", create()))
+                .await
+                .expect("a manager creates templates")
+                .into_inner()
+                .template
+                .expect("template");
+        let annotations = &created.metadata.as_ref().expect("metadata").annotations;
+        assert_eq!(
+            annotations
+                .get(crate::auth::workspace_managers::MANAGER_ANNOTATION)
+                .map(String::as_str),
+            Some("mtls:cluster-a")
+        );
+
+        let denied = handle_delete_sandbox_template(&state, managed_request("cluster-b", delete()))
+            .await
+            .expect_err("another manager can't delete the template");
+        assert_eq!(
+            denied.message(),
+            crate::auth::workspace_managers::NOT_THE_RECORDED_MANAGER
+        );
+        handle_delete_sandbox_template(&state, managed_request("cluster-a", delete()))
+            .await
+            .expect("the recorded manager deletes its template");
+    }
+
     #[tokio::test]
     async fn sandbox_template_handlers_create_get_list_and_delete_workspace_resource() {
         let state = test_server_state().await;
@@ -8652,6 +9140,78 @@ mod tests {
         )
         .await
         .expect_err("deleted template should not be fetchable");
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_resolves_a_template_family_to_its_latest_revision() {
+        let state = test_server_state().await;
+        for (name, generation) in [("agent-r1", "1"), ("agent-r10", "10"), ("agent-r2", "2")] {
+            let mut template = test_workload_template(name);
+            let labels = &mut template.metadata.as_mut().expect("metadata").labels;
+            labels.insert(TEMPLATE_FAMILY_LABEL.to_string(), "agent".to_string());
+            labels.insert(
+                TEMPLATE_GENERATION_LABEL.to_string(),
+                generation.to_string(),
+            );
+            handle_create_sandbox_template(
+                &state,
+                authed_request(CreateSandboxTemplateRequest {
+                    request_id: String::new(),
+                    template: Some(template),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                }),
+            )
+            .await
+            .expect("template create should succeed");
+        }
+        let create = |workload_template: &str| CreateSandboxRequest {
+            request_id: String::new(),
+            name: String::new(),
+            spec: Some(SandboxSpec::default()),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            await_main_process_attachment: false,
+            workload_template: workload_template.to_string(),
+            service_exposures: Vec::new(),
+        };
+
+        let session = handle_create_sandbox(&state, authed_request(create("agent")))
+            .await
+            .expect("family name should resolve")
+            .into_inner()
+            .sandbox
+            .expect("created sandbox");
+        assert_eq!(
+            session
+                .created_from_workload_template
+                .as_ref()
+                .map(|provenance| provenance.name.as_str()),
+            Some("agent-r10")
+        );
+
+        let pinned = handle_create_sandbox(&state, authed_request(create("agent-r2")))
+            .await
+            .expect("an exact name still wins")
+            .into_inner()
+            .sandbox
+            .expect("created sandbox");
+        assert_eq!(
+            pinned
+                .created_from_workload_template
+                .as_ref()
+                .map(|provenance| provenance.name.as_str()),
+            Some("agent-r2")
+        );
+
+        let missing = handle_create_sandbox(&state, authed_request(create("unknown")))
+            .await
+            .expect_err("an unknown family is not found");
         assert_eq!(missing.code(), tonic::Code::NotFound);
     }
 

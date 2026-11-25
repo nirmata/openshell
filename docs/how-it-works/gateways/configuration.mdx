@@ -305,6 +305,10 @@ log_level             = "info"
 # Activate only after retiring incompatible gateways and outstanding driver work.
 enable_sandbox_updates = false
 
+# Per workspace, the identities allowed to create and change sandboxes, workload
+# templates, and providers. Omit a workspace to allow any authorized caller.
+# workspace_managers = { agents = ["mtls:openshell-k8s-controller"] }
+
 # Activate only after every gateway that can serve traffic supports workspace secrets.
 enable_workspace_secrets = false
 # Let mTLS operators read workspace secret values.
@@ -735,6 +739,59 @@ This is not an automatic mixed-version migration switch. Do not downgrade while
 an image update is pending or retained sandboxes require the private image
 revision protocol. SQLite supports one gateway process only; activation attests
 that the previous process has stopped, not that sharing a SQLite file enables HA.
+
+## Workspace Managers
+
+`[openshell.gateway.workspace_managers]` maps a workspace name to the identities
+allowed to create and change that workspace's sandboxes, workload templates,
+and providers. In a workspace without an entry, any authorized caller can,
+which is the default behavior.
+This setting is experimental and supports the Kubernetes controller prototype.
+
+```toml
+[openshell.gateway.workspace_managers]
+agents = ["mtls:openshell-k8s-controller"]
+```
+
+Write each identity as `<provider>:<subject>`. The subject is the client
+certificate CN for `mtls` and `operator`, and the token's `sub` claim for
+`oidc` and `cloudflare_access`. The gateway rejects identities without one of
+these prefixes, and workspaces with an empty list, when it loads the file.
+
+In a listed workspace, only its identities can create, delete, stop, start,
+suspend, resume, or update sandboxes, attach or detach providers, expose
+services, approve or edit policy drafts, or change a sandbox's configuration.
+They are also the only identities that can create or delete workload
+templates, and create, update, or delete providers or change their refresh
+configuration. Other callers can still list and inspect these objects, read
+logs, and exec.
+Operators, and users with the configured admin role, can still stop and delete
+sandboxes in an emergency; this includes mTLS certificates whose OU matches the
+admin role. Without an admin role, only operators have this access. Sandbox
+supervisors are unaffected. Other workspaces on the same gateway aren't
+affected.
+
+Provider type profiles and workspace secrets stay writable by workspace
+admins, because they define what a provider can be rather than declaring one.
+
+The gateway records the creating identity on each new sandbox, workload
+template, and provider in the `internal.openshell.ai/workspace-manager`
+annotation. Only that identity can change the object afterward, so one listed
+manager can't change another's objects. The emergency stop and delete apply
+to sandboxes only.
+
+Change a workspace's list only while the workspace has no sandboxes, workload
+templates, or providers. Each of them also records its workspace's list in
+effect when it was created, and the gateway refuses to start if any existing
+one recorded a different list. Objects created before you first listed a
+workspace count as created under an empty list. To change a list, delete the
+workspace's sandboxes, workload templates, and providers with the previous
+list in place. Changing a manager's certificate CN or token subject is
+also a change to the list.
+
+Give every gateway replica the same lists. Each replica checks them only when
+it starts, so during a rolling update that changes them, new replicas refuse to
+start while old ones keep enforcing the previous lists.
 
 ## Workspace Secrets
 

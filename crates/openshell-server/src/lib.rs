@@ -902,6 +902,11 @@ pub(crate) async fn run_server(
         return Ok(());
     };
     let store = Arc::new(store);
+    // Changing a managers list would hand existing objects to a different
+    // writer, so it's allowed only while the workspace has none.
+    auth::workspace_managers::verify_unchanged(&store, &config.workspace_managers)
+        .await
+        .map_err(Error::config)?;
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(
         &config,
         config_file.as_ref(),

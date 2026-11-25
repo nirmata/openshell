@@ -585,6 +585,12 @@ fn prepare_server_config_with_drivers(
     if let Some(auth) = file.as_ref().and_then(|f| f.openshell.gateway.auth.clone()) {
         config.auth = auth;
     }
+    if let Some(managers) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.workspace_managers.clone())
+    {
+        config.workspace_managers = managers;
+    }
     if let Some(audit) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.audit.clone())

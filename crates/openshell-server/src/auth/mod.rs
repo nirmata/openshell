@@ -27,5 +27,6 @@ pub mod sandbox_methods;
 pub mod sandbox_session;
 pub mod supervisor_token;
 pub mod workspace_authz;
+pub mod workspace_managers;
 
 pub use http::router;

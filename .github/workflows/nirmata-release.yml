@@ -69,7 +69,9 @@ jobs:
       - name: Build the gateway and controller
         run: |
           rustup show active-toolchain || rustup toolchain install
-          cargo build --release --locked -p openshell-gateway -p openshell-k8s-controller
+          # The gateway links the policy prover's Z3, built from source.
+          cargo build --release --locked -p openshell-gateway -p openshell-k8s-controller \
+            --features openshell-gateway/vendored-z3
           install -d "deploy/docker/.build/prebuilt-binaries/${ARCH}"
           install -m 0755 target/release/openshell-gateway target/release/openshell-k8s-controller \
             "deploy/docker/.build/prebuilt-binaries/${ARCH}/"

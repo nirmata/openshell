@@ -21,7 +21,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 COMPONENT="${COMPONENT:-k8s-controller}"
 case "${COMPONENT}" in
-  k8s-controller | gateway) BINARY="openshell-${COMPONENT}" ;;
+  k8s-controller) BINARY=openshell-k8s-controller FEATURES="" SETUP=":" ;;
+  # The gateway links the policy prover's Z3; build it from source, as
+  # release builds do, which needs cmake.
+  gateway)
+    BINARY=openshell-gateway FEATURES="--features vendored-z3"
+    SETUP="apt-get update -qq && apt-get install -y -qq cmake >/dev/null"
+    ;;
   *) echo "unsupported COMPONENT: ${COMPONENT}" >&2; exit 1 ;;
 esac
 CC_BASE=gcr.io/distroless/cc-debian13@sha256:532c7a94f9e96ba9db75eb9388f4227751131c7cb0a411d1a8521af4096135de
@@ -42,11 +48,11 @@ elif command -v cargo-zigbuild >/dev/null 2>&1; then
 else
   BASE_ARGS=(--build-arg "K8S_CONTROLLER_BASE_IMAGE=${CC_BASE}")
   toolchain="$(awk -F'"' '/^channel/ {print $2}' "${ROOT}/rust-toolchain.toml")"
-  echo "Building ${BINARY} for linux/${ARCH} in rust:${toolchain}-bookworm..."
+  echo "Building ${BINARY} for linux/${ARCH} in rust:${toolchain}-trixie..."
   docker run --rm -v "${ROOT}:/src" -w /src \
     -v openshell-k8s-ctl-target:/target -v openshell-k8s-ctl-cargo:/usr/local/cargo/registry \
-    -e CARGO_TARGET_DIR=/target "rust:${toolchain}-bookworm" \
-    sh -c "cargo build -q --locked --release -p ${BINARY} \
+    -e CARGO_TARGET_DIR=/target "rust:${toolchain}-trixie" \
+    sh -c "${SETUP} && cargo build -q --locked --release -p ${BINARY} ${FEATURES} \
       && install -m 0755 /target/release/${BINARY} /src/deploy/docker/.build/prebuilt-binaries/${ARCH}/"
 fi
 cd "${ROOT}"

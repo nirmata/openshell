@@ -817,6 +817,7 @@ async fn handle_sandbox_delete(app: &mut App, tx: mpsc::UnboundedSender<Event>) 
     }
 
     let req = openshell_core::proto::DeleteSandboxRequest {
+        expected_sandbox_id: String::new(),
         workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
         request_id: String::new(),
         allow_missing: true,

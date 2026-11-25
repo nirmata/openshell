@@ -4580,6 +4580,7 @@ pub async fn sandbox_delete(
 
         let response = match client
             .delete_sandbox(DeleteSandboxRequest {
+                expected_sandbox_id: String::new(),
                 request_id: String::new(),
                 allow_missing: true,
                 name: name.clone(),

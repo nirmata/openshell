@@ -555,6 +555,7 @@ pub struct RemoteSandbox {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayError {
+    /// The name refers to a different sandbox than the one recorded.
     Collision,
     /// The gateway definitively refused this request before any side effect.
     Rejected,
@@ -602,7 +603,8 @@ pub trait Persistence: Send + Sync {
 pub trait Gateway: Send + Sync {
     async fn create(&self, binding: &Binding) -> Result<RemoteSandbox, GatewayError>;
     async fn get(&self, binding: &Binding) -> Result<Option<RemoteSandbox>, GatewayError>;
-    async fn delete(&self, binding: &Binding) -> Result<(), GatewayError>;
+    /// Deletes the sandbox only if its gateway ID is `sandbox_id`.
+    async fn delete(&self, binding: &Binding, sandbox_id: &str) -> Result<(), GatewayError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -728,11 +730,16 @@ pub async fn advance(
                         Some(now.saturating_add(backoff(status.journal.delete_attempts)));
                     status.report("Progressing", "Deleting");
                     persistence.save(status).await?;
-                    if gateway.delete(&status.journal.binding).await.is_ok() {
-                        status.journal.delete_accepted = true;
-                        status.report("Progressing", "WaitingForAbsence");
-                    } else {
-                        status.report("Progressing", "DeleteUncertain");
+                    let sandbox_id = status.sandbox_id.clone().unwrap_or_default();
+                    match gateway.delete(&status.journal.binding, &sandbox_id).await {
+                        Ok(()) => {
+                            status.journal.delete_accepted = true;
+                            status.report("Progressing", "WaitingForAbsence");
+                        }
+                        Err(GatewayError::Collision) => {
+                            status.report("Blocked", "IdentityMismatch");
+                        }
+                        Err(_) => status.report("Progressing", "DeleteUncertain"),
                     }
                 } else {
                     status.report("Blocked", "DeleteReplayExhausted");

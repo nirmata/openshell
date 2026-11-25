@@ -101,6 +101,7 @@ pub(in crate::grpc::mutation_replay) async fn exercise_protected_backend(url: &s
     configure_key(&mut first, &directory);
     configure_key(&mut second, &directory);
     let req = DeleteSandboxRequest {
+        expected_sandbox_id: String::new(),
         name: "keyed-restart".into(),
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             "default".to_string(),
@@ -275,6 +276,7 @@ async fn durable_sandbox_mutations_hide_unauthorized_workspaces() {
         let status = run(
             &state,
             non_member_request(DeleteSandboxRequest {
+                expected_sandbox_id: String::new(),
                 name: "hidden".into(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 allow_missing: false,
@@ -382,6 +384,7 @@ async fn sandbox_replay_survives_status_churn_but_never_selects_replacement() {
 async fn keyed_fingerprints_fail_closed_on_missing_or_rotated_keys() {
     let missing = test_server_state().await;
     let req = DeleteSandboxRequest {
+        expected_sandbox_id: String::new(),
         name: "missing".into(),
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             "default".to_string(),
@@ -431,6 +434,7 @@ async fn keyed_fingerprints_fail_closed_on_missing_or_rotated_keys() {
 async fn original_payload_is_identity_and_current_transformation_is_a_replay_guard() {
     let (_directory, state) = protected_state().await;
     let original = DeleteSandboxRequest {
+        expected_sandbox_id: String::new(),
         name: "original".into(),
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             "default".to_string(),

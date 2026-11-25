@@ -35,6 +35,7 @@ struct MockGateway<'a> {
     creates: Mutex<Vec<String>>,
     deletes: Mutex<Vec<String>>,
     delete_error: bool,
+    delete_collision: bool,
 }
 
 #[async_trait]
@@ -57,15 +58,21 @@ impl Gateway for MockGateway<'_> {
         Ok(self.current.lock().unwrap().clone())
     }
 
-    async fn delete(&self, binding: &Binding) -> Result<(), GatewayError> {
+    async fn delete(&self, binding: &Binding, sandbox_id: &str) -> Result<(), GatewayError> {
         let durable = self.store.durable.lock().unwrap();
-        assert!(durable.sandbox_id.is_some(), "receipt must precede delete");
+        assert_eq!(
+            durable.sandbox_id.as_deref(),
+            Some(sandbox_id),
+            "delete must name the recorded sandbox"
+        );
         assert!(durable.journal.delete_attempts > 0);
         self.deletes
             .lock()
             .unwrap()
             .push(binding.delete_request_id.clone());
-        if self.delete_error {
+        if self.delete_collision {
+            Err(GatewayError::Collision)
+        } else if self.delete_error {
             Err(GatewayError::Uncertain)
         } else {
             Ok(())
@@ -105,6 +112,7 @@ fn mock(store: &Store) -> MockGateway<'_> {
         creates: Mutex::default(),
         deletes: Mutex::default(),
         delete_error: false,
+        delete_collision: false,
     }
 }
 
@@ -203,6 +211,35 @@ async fn delete_during_ambiguous_create_recovers_receipt_then_waits_for_absence(
             .unwrap(),
         Outcome::Finalize
     );
+}
+
+#[tokio::test]
+async fn delete_that_finds_a_different_sandbox_blocks_without_finalizing() {
+    let mut status = initial();
+    let accepted = remote(&status, "Ready");
+    let store = Store {
+        durable: Mutex::new(status.clone()),
+        fail: false,
+    };
+    let mut gateway = mock(&store);
+    gateway.delete_collision = true;
+    gateway
+        .create_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(accepted.clone()));
+    advance(&mut status, false, NOW, &gateway, &store)
+        .await
+        .unwrap();
+    *gateway.current.lock().unwrap() = Some(accepted);
+    assert_eq!(
+        advance(&mut status, true, NOW + 30, &gateway, &store)
+            .await
+            .unwrap(),
+        Outcome::Requeue
+    );
+    assert_eq!(status.reason, "IdentityMismatch");
+    assert!(!status.journal.delete_accepted);
 }
 
 #[tokio::test]

@@ -389,7 +389,7 @@ impl Gateway for RpcGateway {
         }
     }
 
-    async fn delete(&self, binding: &Binding) -> Result<(), GatewayError> {
+    async fn delete(&self, binding: &Binding, sandbox_id: &str) -> Result<(), GatewayError> {
         tokio::time::timeout(
             CALL_TIMEOUT,
             self.grpc().delete_sandbox(DeleteSandboxRequest {
@@ -397,11 +397,18 @@ impl Gateway for RpcGateway {
                 name: binding.sandbox_name.clone(),
                 allow_missing: true,
                 request_id: binding.delete_request_id.clone(),
+                expected_sandbox_id: sandbox_id.to_string(),
             }),
         )
         .await
         .map_err(|_| GatewayError::Uncertain)?
-        .map_err(|_| GatewayError::Uncertain)?;
+        .map_err(|status| {
+            if status.code() == tonic::Code::Aborted {
+                GatewayError::Collision
+            } else {
+                GatewayError::Uncertain
+            }
+        })?;
         Ok(())
     }
 }
@@ -1416,7 +1423,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn delete(&self, _: &Binding) -> Result<(), GatewayError> {
+        async fn delete(&self, _: &Binding, _: &str) -> Result<(), GatewayError> {
             // The record is absent, so an allow-missing delete succeeds.
             self.calls.lock().unwrap().push("delete");
             Ok(())

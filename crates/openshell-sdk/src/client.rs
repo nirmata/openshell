@@ -433,6 +433,7 @@ impl OpenShellClient {
         let response = self
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    expected_sandbox_id: String::new(),
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
                     name: name.to_string(),
@@ -1552,6 +1553,7 @@ impl WorkspaceScopedClient {
             .client
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
+                    expected_sandbox_id: String::new(),
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
                     name: name.to_string(),

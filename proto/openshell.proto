@@ -1681,6 +1681,10 @@ message DeleteSandboxRequest {
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 4;
+  // Optional sandbox ID. When set, the delete fails with ABORTED unless the
+  // sandbox with this name has this ID, so a caller never deletes a sandbox
+  // that replaced the one it checked.
+  string expected_sandbox_id = 5;
 }
 
 // Stop sandbox request.

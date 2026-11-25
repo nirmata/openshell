@@ -2050,6 +2050,10 @@ async fn handle_delete_sandbox_inner(
             preconditions.expected_sandbox_id = Some(sandbox.object_id().to_string());
         }
     }
+    if !req.expected_sandbox_id.is_empty() {
+        // The caller names the sandbox it checked; delete only that one.
+        preconditions.expected_sandbox_id = Some(req.expected_sandbox_id);
+    }
     let result = state
         .compute
         .delete_sandbox_allow_missing_with_preconditions(
@@ -6791,6 +6795,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_with_a_different_expected_sandbox_id_is_aborted() {
+        let state = test_server_state().await;
+        let mut current = test_sandbox("pinned-name", Vec::new());
+        current.metadata.as_mut().unwrap().id = "sandbox-current".to_string();
+        state.store.put_message(&current).await.unwrap();
+        let delete = |expected: &str| {
+            authed_request(DeleteSandboxRequest {
+                expected_sandbox_id: expected.to_string(),
+                request_id: String::new(),
+                allow_missing: true,
+                name: "pinned-name".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            })
+        };
+
+        let error = handle_delete_sandbox_inner(&state, delete("sandbox-replaced"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Aborted);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "pinned-name")
+                .await
+                .unwrap()
+                .is_some(),
+            "a mismatched delete must leave the sandbox in place"
+        );
+
+        let response = handle_delete_sandbox_inner(&state, delete("sandbox-current"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.sandbox_id, "sandbox-current");
+    }
+
+    #[tokio::test]
     async fn delete_handler_ends_telemetry_for_the_resolved_sandbox_id() {
         let state = test_server_state().await;
         let mut original = test_sandbox("reused-name", Vec::new());
@@ -6810,6 +6853,7 @@ mod tests {
             handle_delete_sandbox_inner(
                 &delete_state,
                 authed_request(DeleteSandboxRequest {
+                    expected_sandbox_id: String::new(),
                     request_id: String::new(),
                     allow_missing: false,
                     name: "reused-name".to_string(),
@@ -8357,6 +8401,7 @@ mod tests {
             })
         };
         let delete = || DeleteSandboxRequest {
+            expected_sandbox_id: String::new(),
             name: "managed".to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
@@ -11302,6 +11347,7 @@ mod tests {
         let err = handle_delete_sandbox(
             &state,
             non_member_request(DeleteSandboxRequest {
+                expected_sandbox_id: String::new(),
                 request_id: String::new(),
                 allow_missing: false,
                 name: ("any").to_string(),

@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Publishes the Nirmata build: the gateway and Kubernetes controller images
+# and both Helm charts. The sandbox and supervisor are unchanged from
+# upstream, so the gateway chart pins upstream's images for the commit this
+# branch is based on.
+#
+# Run it by pushing a tag such as v0.1.11-nirmata.1, or from the Actions tab
+# with a version.
+
+name: Nirmata Release
+
+on:
+  push:
+    tags: ["v*-nirmata.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish, such as 0.1.11-nirmata.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io/nirmata/openshell
+  CHARTS: oci://ghcr.io/nirmata/charts
+  UPSTREAM: https://github.com/ai-openshell/openshell.git
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        env:
+          INPUT: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${INPUT:-${REF_NAME#v}}"
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+            || { echo "invalid version: ${version}" >&2; exit 1; }
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  images:
+    needs: version
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the gateway and controller
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --release --locked -p openshell-gateway -p openshell-k8s-controller
+          install -d "deploy/docker/.build/prebuilt-binaries/${ARCH}"
+          install -m 0755 target/release/openshell-gateway target/release/openshell-k8s-controller \
+            "deploy/docker/.build/prebuilt-binaries/${ARCH}/"
+
+      - uses: ./.github/actions/setup-buildx
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.arch }} images
+        run: |
+          # A binary built without zig links libgcc_s, so the controller
+          # needs the distroless cc base.
+          cc_base=gcr.io/distroless/cc-debian13@sha256:532c7a94f9e96ba9db75eb9388f4227751131c7cb0a411d1a8521af4096135de
+          for component in gateway k8s-controller; do
+            docker buildx build --builder openshell \
+              --platform "linux/${ARCH}" \
+              --file "deploy/docker/Dockerfile.${component}" \
+              --target "${component}" \
+              --build-arg "K8S_CONTROLLER_BASE_IMAGE=${cc_base}" \
+              --tag "${REGISTRY}/${component}:${VERSION}-${ARCH}" \
+              --provenance=mode=min \
+              --push .
+          done
+
+  manifests:
+    needs: [version, images]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multi-arch tags
+        run: |
+          for component in gateway k8s-controller; do
+            docker buildx imagetools create \
+              --tag "${REGISTRY}/${component}:${VERSION}" \
+              "${REGISTRY}/${component}:${VERSION}-amd64" \
+              "${REGISTRY}/${component}:${VERSION}-arm64"
+          done
+
+  charts:
+    needs: [version, manifests]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Find the upstream base commit
+        id: base
+        run: |
+          git fetch --quiet "${UPSTREAM}" main
+          echo "commit=$(git merge-base HEAD FETCH_HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Package the charts
+        env:
+          BASE: ${{ steps.base.outputs.commit }}
+        run: |
+          gateway=deploy/helm/openshell
+          controller=deploy/helm/openshell-k8s-controller
+          for chart in "${gateway}" "${controller}"; do
+            yq -i ".version = \"${VERSION}\" | .appVersion = \"${VERSION}\"" "${chart}/Chart.yaml"
+          done
+          # The Nirmata gateway image; upstream's sandbox and supervisor
+          # images for the base commit.
+          yq -i "
+            .gateway.image.registry = \"ghcr.io\" |
+            .gateway.image.repository = \"nirmata/openshell/gateway\" |
+            .sandboxRuntime.image.tag = \"${BASE}\" |
+            .supervisor.image.tag = \"${BASE}\"
+          " "${gateway}/values.yaml"
+          helm package "${gateway}" --destination dist
+          helm package "${controller}" --destination dist
+
+      - name: Push the charts
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "${TOKEN}" | helm registry login ghcr.io --username "${ACTOR}" --password-stdin
+          for package in dist/*.tgz; do
+            helm push "${package}" "${CHARTS}"
+          done

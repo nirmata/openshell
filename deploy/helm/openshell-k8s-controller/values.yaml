@@ -8,7 +8,7 @@ fullnameOverride: ""
 
 image:
   # -- Controller image repository.
-  repository: ghcr.io/nvidia/openshell/k8s-controller
+  repository: ghcr.io/nirmata/openshell/k8s-controller
   # -- Image tag. Defaults to the chart appVersion.
   tag: ""
   # -- Image pull policy.

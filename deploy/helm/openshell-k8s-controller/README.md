@@ -94,7 +94,7 @@ again.
 | `reportGatewayPhase` | `true` | Report the gateway's runtime phase in sandbox status. |
 | `crds.install` | `true` | Install the CRDs. Set `false` in every release but one. |
 | `userRoles.create` | `true` | Create the ClusterRoles for people. Set `false` in every release but one. |
-| `image.repository` | `ghcr.io/nvidia/openshell/k8s-controller` | Controller image. |
+| `image.repository` | `ghcr.io/nirmata/openshell/k8s-controller` | Controller image. |
 | `image.tag` | chart `appVersion` | Image tag. |
 | `hostAliases` | `[]` | Extra `/etc/hosts` entries, to reach a gateway that cluster DNS doesn't resolve. |
 

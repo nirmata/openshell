@@ -54,7 +54,8 @@ one a single commit so the branch rebases cleanly.
 Push a tag such as `v0.1.11-nirmata.1` on `nirmata/main`.
 `.github/workflows/nirmata-release.yml` builds the gateway and controller
 images for amd64 and arm64, pushes them to `ghcr.io/nirmata/openshell`, and
-pushes both charts to `oci://ghcr.io/nirmata/charts`.
+pushes both charts to `oci://ghcr.io/nirmata/charts`. The gateway includes
+only the Kubernetes compute driver.
 
 Before tagging, run the in-cluster runbook, which builds the gateway and
 controller from the checkout:

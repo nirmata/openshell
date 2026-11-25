@@ -14,6 +14,8 @@
 #      Ready and run a command in the sandbox.
 #   5. Check that the sandbox's workload pod can't open connections directly,
 #      while an ordinary pod can.
+#   5a. With E2E_ARGOCD=1, deliver two sandboxes from a Helm chart with Argo
+#      CD, and check sync, health, drift detection with self-heal, and prune.
 #   6. Delete namespace agents and check that the gateway sandbox, template,
 #      and provider are removed and the namespace finishes deleting.
 # The CLI configuration lives in a temporary directory, so your registered
@@ -34,6 +36,8 @@
 #                          this checkout is based on, from remote upstream)
 #   E2E_CILIUM_VERSION     Cilium version (default: 1.18.1)
 #   E2E_AGENT_SANDBOX_VERSION  Agent Sandbox release (default: v1.0.12)
+#   E2E_ARGOCD=1           also run the Argo CD check
+#   E2E_ARGOCD_VERSION     Argo CD version (default: v3.1.8)
 #   E2E_KEEP_CLUSTER=1     keep the cluster afterward
 #   DEMO_PAUSE=1           pause between steps
 #   OPENSHELL_CLI          CLI binary (default: openshell)
@@ -47,6 +51,7 @@ CHART="${E2E_CHART:-oci://ghcr.io/nirmata/charts/openshell}"
 CHART_VERSION="${E2E_CHART_VERSION:-}"
 CILIUM_VERSION="${E2E_CILIUM_VERSION:-1.18.1}"
 AGENT_SANDBOX_VERSION="${E2E_AGENT_SANDBOX_VERSION:-v1.0.12}"
+ARGOCD_VERSION="${E2E_ARGOCD_VERSION:-v3.1.8}"
 CLI="${OPENSHELL_CLI:-openshell}"
 GW=kind
 NAMESPACE=agents
@@ -269,6 +274,128 @@ echo "sandbox workload pod: ${sandboxed:-no result}; ordinary pod: ${ordinary}"
 [ "${ordinary}" = "CONNECTED" ] || fail "the ordinary pod can't reach the internet, so the check proves nothing"
 [ "${sandboxed}" = "BLOCKED" ] || fail "the sandbox workload pod opened a direct connection"
 pass "the workload can't connect out directly; its traffic must go through the supervisor"
+
+if [ "${E2E_ARGOCD:-0}" = "1" ]; then
+step "5a. Deliver sandboxes with Argo CD: sync, health, drift, and prune"
+run kubectl create namespace argocd
+run kubectl apply -n argocd --server-side --force-conflicts \
+  -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml" >/dev/null
+# Argo CD reports a custom resource as Healthy unless it has a health check.
+# This one reads the Ready condition once the controller has seen the
+# current generation.
+cat >"${STATE}/argocd-health.yaml" <<'PATCH'
+data:
+  resource.customizations.health.openshell.ai_OpenShellSandbox: |
+    hs = { status = "Progressing", message = "Waiting for the controller" }
+    if obj.status ~= nil and obj.status.observedGeneration == obj.metadata.generation then
+      for _, condition in ipairs(obj.status.conditions or {}) do
+        if condition.type == "Ready" then
+          hs.message = condition.message
+          if condition.status == "True" then
+            hs.status = "Healthy"
+          elseif obj.status.phase == "Blocked" then
+            hs.status = "Degraded"
+          end
+        end
+      end
+    end
+    return hs
+PATCH
+run kubectl -n argocd patch configmap argocd-cm --type merge --patch-file "${STATE}/argocd-health.yaml"
+
+# A chart of two sandboxes (0.1.0) and one (0.2.0), served from the cluster.
+chart="${STATE}/argo-agents" repo="${STATE}/chart-repo"
+mkdir -p "${chart}/templates" "${repo}"
+printf 'apiVersion: v2\nname: argo-agents\nversion: 0.1.0\n' >"${chart}/Chart.yaml"
+cat >"${chart}/templates/agents.yaml" <<'TEMPLATE'
+{{- range .Values.agents }}
+---
+apiVersion: openshell.ai/v1alpha1
+kind: OpenShellSandbox
+metadata:
+  name: {{ . }}
+spec:
+  templateRef:
+    name: demo-agent
+  providers: [github]
+{{- end }}
+TEMPLATE
+printf 'agents: [argo-agent-a, argo-agent-b]\n' >"${chart}/values.yaml"
+run helm package "${chart}" --version 0.1.0 --destination "${repo}" >/dev/null
+printf 'agents: [argo-agent-a]\n' >"${chart}/values.yaml"
+run helm package "${chart}" --version 0.2.0 --destination "${repo}" >/dev/null
+run helm repo index "${repo}" --url http://charts.argocd.svc
+run kubectl -n argocd create configmap charts --from-file="${repo}"
+kubectl apply -n argocd -f - <<'YAML'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: charts
+  labels: { app: charts }
+spec:
+  containers:
+    - name: httpd
+      image: busybox:1.36
+      command: [httpd, -f, -p, "8080", -h, /srv]
+      volumeMounts: [{ name: charts, mountPath: /srv }]
+  volumes: [{ name: charts, configMap: { name: charts } }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: charts
+spec:
+  selector: { app: charts }
+  ports: [{ port: 80, targetPort: 8080 }]
+YAML
+run kubectl -n argocd wait --for=condition=Ready pod/charts --timeout=120s
+run kubectl -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+run kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+
+kubectl apply -f - <<YAML
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agents
+  namespace: argocd
+spec:
+  project: default
+  source: { repoURL: http://charts.argocd.svc, chart: argo-agents, targetRevision: 0.1.0 }
+  destination: { server: https://kubernetes.default.svc, namespace: ${NAMESPACE} }
+  syncPolicy: { automated: { prune: true } }
+YAML
+app() { kubectl -n argocd get application agents -o "jsonpath={.status.sync.status}/{.status.health.status}" 2>/dev/null; }
+wait_app() {
+  for _ in $(seq 1 300); do
+    # $1 is a pattern, such as OutOfSync/*.
+    # shellcheck disable=SC2053
+    [[ "$(app)" == $1 ]] && return 0
+    sleep 2
+  done
+  fail "Application agents is $(app), not $1"
+}
+wait_app Synced/Healthy
+pass "Argo CD synced two sandboxes, and it reports them Healthy once they're Ready"
+
+run kubectl patch ossbx argo-agent-a -n "${NAMESPACE}" --type=merge -p '{"spec":{"providers":[]}}'
+wait_app 'OutOfSync/*'
+run kubectl -n argocd patch application agents --type=merge \
+  -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+wait_app Synced/Healthy
+[ "$(kubectl get ossbx argo-agent-a -n "${NAMESPACE}" -o 'jsonpath={.spec.providers[0]}')" = github ] \
+  || fail "self-heal didn't restore the declared provider"
+pass "Argo CD detected the changed sandbox and restored it from Git"
+
+pruned="$(kubectl get ossbx argo-agent-b -n "${NAMESPACE}" -o jsonpath='{.status.sandboxName}')"
+run kubectl -n argocd patch application agents --type=merge -p '{"spec":{"source":{"targetRevision":"0.2.0"}}}'
+run kubectl wait --for=delete ossbx/argo-agent-b -n "${NAMESPACE}" --timeout=300s
+wait_app Synced/Healthy
+[[ "$(os sandbox get "${pruned}" --workspace "${NAMESPACE}" 2>&1)" == *"not found"* ]] \
+  || fail "the pruned sandbox ${pruned} is still in the gateway"
+pass "Argo CD pruned argo-agent-b, and the controller deleted its gateway sandbox first"
+# Stop delivering before the namespace is deleted; the sandbox stays.
+run kubectl -n argocd delete application agents
+fi
 
 step "6. Delete namespace ${NAMESPACE}"
 started=$(date +%s)

@@ -377,6 +377,9 @@ registered gateways:
 DEMO_PAUSE=1 tasks/scripts/demo-k8s-controller-in-cluster.sh
 ```
 
+The script builds the gateway and controller images from your checkout. Set
+`E2E_ARGOCD=1` to also run [Step 8](#step-8-deliver-sandboxes-with-argo-cd).
+
 ### Step 1: create a cluster that enforces NetworkPolicy
 
 The gateway isolates each sandbox with NetworkPolicy: the workload pod may talk
@@ -414,13 +417,37 @@ kubectl -n agent-sandbox-system rollout status deployment
 
 ### Step 3: install the gateway
 
-Install the gateway chart. The `0.0.0-dev` version is the latest build of the
-main branch; use a release version when one includes the features you need.
+The controller needs a gateway with workspace managers. Install the gateway
+chart, listing the identity that the controller connects with as the manager of
+workspace `agents`. In this walkthrough, the controller uses the chart's client
+certificate, `CN=openshell-client`:
 
 ```shell
-helm install openshell oci://quay.io/ai-openshell/charts/openshell \
-  --version 0.0.0-dev --namespace openshell --create-namespace --wait
+cat > gateway-values.yaml <<'EOF'
+gatewayConfig:
+  openshell.gateway:
+    workspace_managers:
+      agents: ["mtls:openshell-client"]
+EOF
+helm install openshell oci://ghcr.io/nirmata/charts/openshell --version VERSION \
+  -f gateway-values.yaml --namespace openshell --create-namespace --wait
 kubectl -n openshell get pods
+```
+
+Replace `VERSION` with a release, such as `0.1.11-nirmata.1`. To use a gateway
+built from your checkout instead, as the script does, build and load the image,
+and install the chart from `deploy/helm/openshell`. Set the sandbox and
+supervisor tags to the upstream commit your checkout is based on:
+
+```shell
+COMPONENT=gateway IMAGE_TAG=demo tasks/scripts/build-k8s-controller-image.sh
+kind load docker-image openshell/gateway:demo --name openshell-e2e
+BASE=$(git merge-base HEAD upstream/main)
+helm install openshell deploy/helm/openshell -f gateway-values.yaml \
+  --namespace openshell --create-namespace --wait \
+  --set gateway.image.registry=docker.io --set gateway.image.repository=openshell/gateway \
+  --set gateway.image.tag=demo --set gateway.image.pullPolicy=Never \
+  --set sandboxRuntime.image.tag="$BASE" --set supervisor.image.tag="$BASE"
 ```
 
 The chart generates a certificate authority, a server certificate, and a client
@@ -470,24 +497,27 @@ ran in `agents`, deleting that namespace would delete the controller before it
 could clean up the gateway sandboxes.
 
 ```shell
-IMAGE_TAG=demo tasks/scripts/build-k8s-controller-image.sh
-kind load docker-image openshell/k8s-controller:demo --name openshell-e2e
-
 kubectl create namespace agents
 kubectl create namespace openshell-system
 kubectl -n openshell-system create secret generic gateway-tls \
   --from-file="$MTLS/ca.crt" --from-file="$MTLS/tls.crt" --from-file="$MTLS/tls.key"
 
-helm install openshell-controller deploy/helm/openshell-k8s-controller \
-  --namespace openshell-system --wait \
+helm install openshell-controller oci://ghcr.io/nirmata/charts/openshell-k8s-controller \
+  --version VERSION --namespace openshell-system --wait \
   --set watchNamespace=agents \
-  --set image.repository=openshell/k8s-controller \
-  --set image.tag=demo \
-  --set image.pullPolicy=Never \
   --set gateway.url=https://openshell.openshell.svc:8080 \
   --set gateway.workspace=agents \
   --set gateway.tls.secretName=gateway-tls
 kubectl -n openshell-system logs deployment/openshell-controller-openshell-k8s-controller
+```
+
+To use a controller built from your checkout, build and load its image, then
+install the chart from `deploy/helm/openshell-k8s-controller` with
+`--set image.repository=openshell/k8s-controller --set image.tag=demo --set image.pullPolicy=Never`:
+
+```shell
+IMAGE_TAG=demo tasks/scripts/build-k8s-controller-image.sh
+kind load docker-image openshell/k8s-controller:demo --name openshell-e2e
 ```
 
 The controller reaches the gateway through its in-cluster Service,
@@ -531,7 +561,72 @@ pod. The workload's traffic can leave only through its supervisor, which
 applies the sandbox's network policy. With kind's default network plugin, both
 would print `CONNECTED`.
 
-### Step 8: delete the namespace
+### Step 8: deliver sandboxes with Argo CD
+
+Argo CD syncs, diffs, and prunes OpenShell resources like any other resource.
+It reports a custom resource as healthy unless it has a health check, so add
+one that reads the `Ready` condition. The check waits until the controller has
+seen the current generation, so a sync isn't reported healthy before the
+controller acts on it:
+
+```yaml
+# In ConfigMap argocd-cm, namespace argocd
+data:
+  resource.customizations.health.openshell.ai_OpenShellSandbox: |
+    hs = { status = "Progressing", message = "Waiting for the controller" }
+    if obj.status ~= nil and obj.status.observedGeneration == obj.metadata.generation then
+      for _, condition in ipairs(obj.status.conditions or {}) do
+        if condition.type == "Ready" then
+          hs.message = condition.message
+          if condition.status == "True" then
+            hs.status = "Healthy"
+          elseif obj.status.phase == "Blocked" then
+            hs.status = "Degraded"
+          end
+        end
+      end
+    end
+    return hs
+```
+
+A stopped or suspended sandbox stays `Ready`, so sleep and wake never change
+the application's health. Then point an Application at the Git path or chart
+that holds your resources, with namespace `agents` as its destination:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agents
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/agents.git
+    path: agents
+    targetRevision: main
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: agents
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+```
+
+What to expect:
+
+- **Sync and health:** the Application is `Healthy` once every sandbox is
+  `Ready`, and `Degraded` while one is blocked, for example with
+  `TemplateNotFound`.
+- **Drift:** an edit outside Git to a field that Git declares, such as
+  `providers`, makes the Application `OutOfSync`. With `selfHeal`, Argo CD
+  restores it, and the controller applies the change to the gateway.
+- **Prune:** removing a sandbox from Git deletes the resource. Its finalizer
+  holds the resource until the gateway sandbox is gone.
+
+With `E2E_ARGOCD=1`, the script runs these checks against a chart served from
+the cluster.
+
+### Step 9: delete the namespace
 
 Deleting a namespace deletes every resource in it. The controller's finalizers
 hold each one until the gateway object is gone:

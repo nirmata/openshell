@@ -23,7 +23,15 @@
 # Environment:
 #   E2E_CLUSTER            kind cluster name (default: openshell-e2e)
 #   E2E_PORT               local port for the gateway port-forward (default: 18080)
-#   E2E_CHART_VERSION      gateway chart version (default: 0.0.0-dev)
+#   E2E_GATEWAY            checkout (default): build the gateway image and use
+#                          the chart from this checkout, with the controller
+#                          as the workspace manager of agents. chart: install
+#                          E2E_CHART at E2E_CHART_VERSION instead.
+#   E2E_CHART              gateway chart (default: oci://ghcr.io/nirmata/charts/openshell)
+#   E2E_CHART_VERSION      gateway chart version, for E2E_GATEWAY=chart
+#   E2E_UPSTREAM_IMAGE_TAG sandbox and supervisor image tag for
+#                          E2E_GATEWAY=checkout (default: the upstream commit
+#                          this checkout is based on, from remote upstream)
 #   E2E_CILIUM_VERSION     Cilium version (default: 1.18.1)
 #   E2E_AGENT_SANDBOX_VERSION  Agent Sandbox release (default: v1.0.12)
 #   E2E_KEEP_CLUSTER=1     keep the cluster afterward
@@ -34,7 +42,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CLUSTER="${E2E_CLUSTER:-openshell-e2e}"
 PORT="${E2E_PORT:-18080}"
-CHART_VERSION="${E2E_CHART_VERSION:-0.0.0-dev}"
+GATEWAY_SOURCE="${E2E_GATEWAY:-checkout}"
+CHART="${E2E_CHART:-oci://ghcr.io/nirmata/charts/openshell}"
+CHART_VERSION="${E2E_CHART_VERSION:-}"
 CILIUM_VERSION="${E2E_CILIUM_VERSION:-1.18.1}"
 AGENT_SANDBOX_VERSION="${E2E_AGENT_SANDBOX_VERSION:-v1.0.12}"
 CLI="${OPENSHELL_CLI:-openshell}"
@@ -115,8 +125,38 @@ run kubectl -n agent-sandbox-system rollout status deployment --timeout=180s
 pass "cluster ${CLUSTER} runs Cilium ${CILIUM_VERSION} and Agent Sandbox ${AGENT_SANDBOX_VERSION}"
 
 step "2. Install the gateway and register it with the CLI"
-run helm install openshell oci://quay.io/ai-openshell/charts/openshell --version "${CHART_VERSION}" \
-  --namespace openshell --create-namespace --wait --timeout 8m
+case "${GATEWAY_SOURCE}" in
+  checkout)
+    upstream_tag="${E2E_UPSTREAM_IMAGE_TAG:-$(git -C "${ROOT}" merge-base HEAD upstream/main 2>/dev/null || true)}"
+    [ -n "${upstream_tag}" ] \
+      || fail "can't find the upstream base commit; add remote upstream or set E2E_UPSTREAM_IMAGE_TAG"
+    run env COMPONENT=gateway IMAGE_TAG=demo bash "${ROOT}/tasks/scripts/build-k8s-controller-image.sh" \
+      >"${STATE}/gateway-build.log" 2>&1 \
+      || { tail -20 "${STATE}/gateway-build.log" >&2; fail "gateway image build failed"; }
+    run kind load docker-image openshell/gateway:demo --name "${CLUSTER}" >/dev/null
+    # The chart's client certificate is the controller's identity.
+    cat >"${STATE}/gateway-values.yaml" <<VALUES
+gateway:
+  image: { registry: docker.io, repository: openshell/gateway, tag: demo, pullPolicy: Never }
+sandboxRuntime:
+  image: { tag: "${upstream_tag}" }
+supervisor:
+  image: { tag: "${upstream_tag}" }
+gatewayConfig:
+  openshell.gateway:
+    workspace_managers:
+      ${NAMESPACE}: ["mtls:openshell-client"]
+VALUES
+    run helm install openshell "${ROOT}/deploy/helm/openshell" -f "${STATE}/gateway-values.yaml" \
+      --namespace openshell --create-namespace --wait --timeout 8m
+    ;;
+  chart)
+    [ -n "${CHART_VERSION}" ] || fail "set E2E_CHART_VERSION to the gateway chart version"
+    run helm install openshell "${CHART}" --version "${CHART_VERSION}" \
+      --namespace openshell --create-namespace --wait --timeout 8m
+    ;;
+  *) fail "E2E_GATEWAY must be checkout or chart" ;;
+esac
 kubectl -n openshell port-forward svc/openshell "${PORT}:8080" >"${STATE}/port-forward.log" 2>&1 &
 forward_pid=$!
 mkdir -p "${MTLS}"

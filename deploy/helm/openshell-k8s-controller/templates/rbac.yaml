@@ -1,0 +1,116 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/ -}}
+{{- $fullname := include "openshell-k8s-controller.fullname" . }}
+{{- $watch := include "openshell-k8s-controller.watchNamespace" . }}
+{{- /*
+The OpenShell resources are granted through a ClusterRoleBinding, not a
+RoleBinding in the watched namespace. Deleting a namespace deletes its
+RoleBindings in no particular order; if the binding went first, the controller
+could no longer remove its finalizers and the namespace would never finish
+deleting. The binding covers only openshell.ai resources, and the controller
+still watches only its own namespace.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-{{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-k8s-controller.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["openshell.ai"]
+    resources: ["openshellsandboxes", "openshellproviders"]
+    verbs: ["list", "watch", "patch"]
+  - apiGroups: ["openshell.ai"]
+    resources: ["openshellsandboxtemplates"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["openshell.ai"]
+    resources:
+      - openshellsandboxes/status
+      - openshellsandboxtemplates/status
+      - openshellproviders/status
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-{{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-k8s-controller.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell-k8s-controller.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-{{ .Release.Namespace }}
+---
+{{- /*
+Providers reference credentials in Secrets. The controller reads them and sends
+their values to the gateway; it never writes Secrets. Deleting resources needs
+no Secrets, so this grant can stay in the watched namespace.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $watch }}
+  labels:
+    {{- include "openshell-k8s-controller.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $watch }}
+  labels:
+    {{- include "openshell-k8s-controller.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell-k8s-controller.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+{{- if .Values.leaderElection.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-k8s-controller.labels" . | nindent 4 }}
+rules:
+  # Create can't be limited by name; the controller creates only its own Lease.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: [{{ $fullname | quote }}]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell-k8s-controller.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "openshell-k8s-controller.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-leader-election
+{{- end }}

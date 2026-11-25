@@ -46,6 +46,8 @@ one a single commit so the branch rebases cleanly.
 | Raw manifests removed in favor of the chart | Packaging |
 | In-cluster runbook against a gateway built from the checkout | Tests |
 | Nirmata images, charts, and release workflow | Fork only |
+| Gateway image built with vendored Z3 | Packaging |
+| Argo CD delivery check in the runbook | Tests |
 
 ## Release
 
@@ -58,7 +60,7 @@ Before tagging, run the in-cluster runbook, which builds the gateway and
 controller from the checkout:
 
 ```shell
-bash tasks/scripts/demo-k8s-controller-in-cluster.sh
+E2E_ARGOCD=1 bash tasks/scripts/demo-k8s-controller-in-cluster.sh
 ```
 
 ## Sync with upstream
@@ -70,7 +72,7 @@ git fetch upstream
 git checkout main && git merge --ff-only upstream/main && git push origin main
 git checkout nirmata/main && git rebase main
 cargo test -p openshell-k8s-controller
-bash tasks/scripts/demo-k8s-controller-in-cluster.sh
+E2E_ARGOCD=1 bash tasks/scripts/demo-k8s-controller-in-cluster.sh
 git push --force-with-lease origin nirmata/main
 ```
 

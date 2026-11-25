@@ -74,6 +74,90 @@ pub struct SandboxSpec {
     pub template_ref: Option<TemplateRef>,
     #[serde(flatten)]
     pub inputs: SandboxInputs,
+    /// Stop the sandbox, keeping its gateway record. Set it back to `false` to
+    /// start a sandbox this controller stopped. The controller never starts a
+    /// sandbox that someone else stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
+}
+
+/// A change to a provisioned sandbox that doesn't need a new resource.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Update {
+    Attach(String),
+    Detach(String),
+    /// Apply the spec's policy. Only network and Cedar rules can change.
+    Policy,
+    Stop,
+    Start,
+}
+
+/// What the controller applied to the gateway sandbox after creating it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Applied {
+    /// Providers attached to the sandbox.
+    #[serde(default)]
+    pub providers: Vec<String>,
+    /// The last policy applied, in the spec's format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "free_form_object")]
+    pub policy: Option<serde_json::Value>,
+    /// True when this controller stopped the sandbox.
+    #[serde(default)]
+    pub stopped: bool,
+    /// Why the gateway refused a change, until the spec changes again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// The spec generation that `refused` applies to.
+    #[serde(default)]
+    pub refused_generation: i64,
+}
+
+impl SandboxStatus {
+    /// What has been applied, starting from the create inputs.
+    #[must_use]
+    pub fn applied(&self) -> Applied {
+        self.applied.clone().unwrap_or_else(|| Applied {
+            providers: self.journal.binding.inputs.providers.clone(),
+            policy: self.journal.binding.inputs.policy.clone(),
+            ..Applied::default()
+        })
+    }
+}
+
+/// Changes that bring a provisioned sandbox in line with its spec, in order.
+///
+/// `phase` is the gateway's sandbox phase. Removing a policy from the spec
+/// keeps the policy last applied; recreate the sandbox to return to the
+/// gateway's default policy.
+#[must_use]
+pub fn pending_updates(spec: &SandboxSpec, status: &SandboxStatus, phase: &str) -> Vec<Update> {
+    let applied = status.applied();
+    let mut updates: Vec<Update> = spec
+        .inputs
+        .providers
+        .iter()
+        .filter(|name| !applied.providers.contains(name))
+        .map(|name| Update::Attach(name.clone()))
+        .collect();
+    updates.extend(
+        applied
+            .providers
+            .iter()
+            .filter(|name| !spec.inputs.providers.contains(name))
+            .map(|name| Update::Detach(name.clone())),
+    );
+    if spec.inputs.policy.is_some() && spec.inputs.policy != applied.policy {
+        updates.push(Update::Policy);
+    }
+    if spec.stopped && !applied.stopped && phase == "Ready" {
+        updates.push(Update::Stop);
+    }
+    if !spec.stopped && applied.stopped && phase == "Stopped" {
+        updates.push(Update::Start);
+    }
+    updates
 }
 
 /// A reference to a workload template.
@@ -154,7 +238,7 @@ pub enum ServiceAuthorization {
 
 impl SandboxSpec {
     /// Why the controller refuses this spec before submitting it, if it does.
-    /// The spec is immutable, so the answer never changes for a resource.
+    /// Only the policy can change after creation, so most answers are final.
     #[must_use]
     pub fn refusal(&self, namespace: &str) -> Option<&'static str> {
         let other_namespace = self
@@ -293,6 +377,9 @@ pub struct SandboxStatus {
     /// Informational runtime phase. Never affects `phase` or the `Ready`
     /// condition, and is omitted when the controller doesn't report it.
     pub gateway_phase: Option<String>,
+    /// Changes applied after creation. Absent until the first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<Applied>,
     pub journal: Journal,
 }
 
@@ -311,6 +398,7 @@ impl SandboxStatus {
             sandbox_id: None,
             template_revision: Some(binding.workload_template.clone()),
             gateway_phase: None,
+            applied: None,
             journal: Journal {
                 binding,
                 create_attempts: 0,
@@ -361,6 +449,9 @@ fn ready_message(phase: &str, reason: &str) -> &'static str {
         "ObservationUnavailable" => "The controller cannot observe the gateway sandbox.",
         "IdentityMismatch" => "The gateway sandbox ID differs from the recorded ID.",
         "BindingChanged" => "The recorded binding differs from the controller binding.",
+        "UpdateRejected" => {
+            "The gateway refused a change to policy or providers; correct the spec."
+        }
         "Deleting" => "The controller is deleting the gateway sandbox.",
         "DeleteUncertain" => "The delete result is unknown; the controller replays the request.",
         "WaitingForAbsence" => "The controller is waiting for the gateway to remove the sandbox.",
@@ -424,14 +515,27 @@ pub fn sync_condition(
     }
 }
 
+/// Startup fields can't change. Policy, providers, and `stopped` can.
+fn immutable_rule() -> String {
+    ["templateRef", "workload", "command", "restartPolicy", "serviceExposures"]
+        .iter()
+        .map(|field| {
+            format!(
+                "has(self.{field}) == has(oldSelf.{field}) && (!has(self.{field}) || self.{field} == oldSelf.{field})"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
 /// Include the transition rule in the actual served CRD, not only in Rust validation.
 pub fn crd() -> Result<serde_json::Value, serde_json::Error> {
     let mut value = serde_json::to_value(OpenShellSandbox::crd())?;
     let schema = &mut value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"];
     schema["spec"]["x-kubernetes-validations"] = serde_json::json!([
         {
-            "rule": "self == oldSelf",
-            "message": "spec is immutable; create a new Sandbox for a different workload"
+            "rule": immutable_rule(),
+            "message": "templateRef, workload, command, restartPolicy, and serviceExposures can't change; create a new sandbox for a different workload"
         },
         {
             "rule": "!(has(self.templateRef) && has(self.workload))",
@@ -605,6 +709,16 @@ pub trait Gateway: Send + Sync {
     async fn get(&self, binding: &Binding) -> Result<Option<RemoteSandbox>, GatewayError>;
     /// Deletes the sandbox only if its gateway ID is `sandbox_id`.
     async fn delete(&self, binding: &Binding, sandbox_id: &str) -> Result<(), GatewayError>;
+    /// Applies one change to a provisioned sandbox. `Rejected` and `Missing`
+    /// are final for this spec; `Uncertain` is retried.
+    async fn update(
+        &self,
+        _binding: &Binding,
+        _update: &Update,
+        _spec: &SandboxSpec,
+    ) -> Result<(), GatewayError> {
+        Err(GatewayError::Uncertain)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -760,6 +874,10 @@ pub async fn advance(
                 }
                 "Provisioning" => status.report("Progressing", "GatewayProgressing"),
                 _ => status.report("Blocked", "GatewayNotReady"),
+            }
+            // A refused change keeps the sandbox blocked until the spec changes.
+            if let Some(reason) = status.applied.as_ref().and_then(|a| a.refused.clone()) {
+                status.report("Blocked", &reason);
             }
         }
     }

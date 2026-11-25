@@ -213,18 +213,28 @@ openshell sandbox exec "$NAME" --workspace agents --no-tty -- echo "hello from a
 Point out: the gateway record carries `kubernetes.openshell.ai/namespace`,
 `name`, and `uid` annotations that point back to the resource.
 
-### Step 4: try to change the workload
+### Step 4: change the sandbox in place
 
 ```shell
 kubectl patch ossbx support-agent -n agents --type=merge \
   -p '{"spec":{"templateRef":{"name":"something-else"}}}'
 ```
 
-Expected: the API server rejects the change with an `immutable` error. The
-workload template can't change on a running sandbox, so create a new resource
-to run a different workload. The prototype makes the whole spec immutable;
-later versions can allow in-place changes to other fields, such as policy and
-providers, while the workload stays immutable.
+Expected: the API server rejects the change. The workload can't change on a
+running sandbox, so create a new resource to run a different workload.
+
+Policy, providers, and `stopped` can change in place. Stop the sandbox, then
+start it again:
+
+```shell
+kubectl patch ossbx support-agent -n agents --type=merge -p '{"spec":{"stopped":true}}'
+kubectl get ossbx support-agent -n agents -w
+```
+
+Expected: within a minute, `GATEWAY PHASE` changes to `Stopped`, and `PHASE`
+stays `Ready`. Set `stopped` back to `false` to start it. The controller starts
+only a sandbox it stopped itself, so an operator's emergency stop stays in
+place.
 
 ### Step 5: change the template
 

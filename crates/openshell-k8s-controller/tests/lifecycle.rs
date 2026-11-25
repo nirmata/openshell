@@ -5,9 +5,9 @@ use std::{collections::VecDeque, sync::Mutex};
 
 use async_trait::async_trait;
 use openshell_k8s_controller::{
-    Binding, ConditionStatus, Gateway, GatewayError, Missing, Outcome, Persistence,
+    Applied, Binding, ConditionStatus, Gateway, GatewayError, Missing, Outcome, Persistence,
     PersistenceError, RemoteSandbox, SandboxInputs, SandboxSpec, SandboxStatus, TemplateRef,
-    advance, crd, sync_conditions,
+    Update, advance, crd, pending_updates, sync_conditions,
 };
 
 const NOW: i64 = 10_000;
@@ -373,7 +373,7 @@ fn generated_crd_uses_transition_cel_and_status_subresource() {
     assert_eq!(
         crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["x-kubernetes-validations"]
             [0]["rule"],
-        "self == oldSelf"
+        "has(self.templateRef) == has(oldSelf.templateRef) && (!has(self.templateRef) || self.templateRef == oldSelf.templateRef) && has(self.workload) == has(oldSelf.workload) && (!has(self.workload) || self.workload == oldSelf.workload) && has(self.command) == has(oldSelf.command) && (!has(self.command) || self.command == oldSelf.command) && has(self.restartPolicy) == has(oldSelf.restartPolicy) && (!has(self.restartPolicy) || self.restartPolicy == oldSelf.restartPolicy) && has(self.serviceExposures) == has(oldSelf.serviceExposures) && (!has(self.serviceExposures) || self.serviceExposures == oldSelf.serviceExposures)"
     );
     assert_eq!(
         crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["x-kubernetes-validations"]
@@ -406,6 +406,7 @@ fn template_in_another_namespace_is_refused() {
             namespace: namespace.map(Into::into),
         }),
         inputs: SandboxInputs::default(),
+        stopped: false,
     };
     assert_eq!(spec(None).refusal("agents"), None);
     assert_eq!(spec(Some("agents")).refusal("agents"), None);
@@ -423,6 +424,7 @@ fn invalid_policy_is_refused() {
             policy: Some(policy),
             ..SandboxInputs::default()
         },
+        stopped: false,
     };
     assert_eq!(
         spec(serde_json::json!({"version": 1, "filesystem_policy": {"read_only": ["/usr"]}}))
@@ -459,7 +461,7 @@ async fn missing_template_or_provider_blocks_with_its_own_reason() {
             (status.phase.as_str(), status.reason.as_str()),
             ("Blocked", reason)
         );
-        // The spec is immutable, so the controller never retries.
+        // The startup fields can't change, so the controller never retries.
         advance(&mut status, false, NOW + 3600, &gateway, &store)
             .await
             .unwrap();
@@ -909,5 +911,113 @@ fn the_helm_chart_crds_are_current() {
         &file[start..],
         openshell_k8s_controller::crd_manifest().unwrap(),
         "regenerate files/crds.yaml with --print-crd"
+    );
+}
+
+fn spec_with(providers: &[&str], policy: Option<serde_json::Value>, stopped: bool) -> SandboxSpec {
+    SandboxSpec {
+        template_ref: None,
+        inputs: SandboxInputs {
+            providers: providers.iter().map(|p| (*p).to_string()).collect(),
+            policy,
+            ..SandboxInputs::default()
+        },
+        stopped,
+    }
+}
+
+fn created_with(providers: &[&str], policy: Option<serde_json::Value>) -> SandboxStatus {
+    let mut status = initial();
+    status.journal.binding.inputs.providers = providers.iter().map(|p| (*p).to_string()).collect();
+    status.journal.binding.inputs.policy = policy;
+    status
+}
+
+#[test]
+fn an_unchanged_spec_needs_no_updates() {
+    let policy = Some(serde_json::json!({"version": 1}));
+    let status = created_with(&["github"], policy.clone());
+    assert!(pending_updates(&spec_with(&["github"], policy, false), &status, "Ready").is_empty());
+}
+
+#[test]
+fn provider_changes_attach_new_and_detach_removed_providers() {
+    let status = created_with(&["github", "nvidia"], None);
+    assert_eq!(
+        pending_updates(
+            &spec_with(&["nvidia", "slack"], None, false),
+            &status,
+            "Ready"
+        ),
+        vec![
+            Update::Attach("slack".into()),
+            Update::Detach("github".into())
+        ]
+    );
+}
+
+#[test]
+fn a_changed_policy_is_applied_and_a_removed_policy_is_kept() {
+    let old = Some(serde_json::json!({"version": 1}));
+    let new = Some(serde_json::json!({"version": 1, "network_policies": {}}));
+    let status = created_with(&[], old);
+    assert_eq!(
+        pending_updates(&spec_with(&[], new, false), &status, "Ready"),
+        vec![Update::Policy]
+    );
+    assert!(pending_updates(&spec_with(&[], None, false), &status, "Ready").is_empty());
+}
+
+#[test]
+fn stop_waits_for_ready_and_start_only_follows_this_controllers_stop() {
+    let status = created_with(&[], None);
+    assert!(pending_updates(&spec_with(&[], None, true), &status, "Provisioning").is_empty());
+    assert_eq!(
+        pending_updates(&spec_with(&[], None, true), &status, "Ready"),
+        vec![Update::Stop]
+    );
+    // Someone else stopped it: leave it stopped.
+    assert!(pending_updates(&spec_with(&[], None, false), &status, "Stopped").is_empty());
+    let mut stopped_here = status;
+    stopped_here.applied = Some(Applied {
+        stopped: true,
+        ..stopped_here.applied()
+    });
+    assert_eq!(
+        pending_updates(&spec_with(&[], None, false), &stopped_here, "Stopped"),
+        vec![Update::Start]
+    );
+    assert!(pending_updates(&spec_with(&[], None, true), &stopped_here, "Stopped").is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_change_blocks_the_sandbox_until_the_spec_changes() {
+    let mut status = initial();
+    let accepted = remote(&status, "Ready");
+    let store = Store {
+        durable: Mutex::new(status.clone()),
+        fail: false,
+    };
+    let gateway = mock(&store);
+    gateway
+        .create_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(accepted.clone()));
+    advance(&mut status, false, NOW, &gateway, &store)
+        .await
+        .unwrap();
+    *gateway.current.lock().unwrap() = Some(accepted);
+    status.applied = Some(Applied {
+        refused: Some("UpdateRejected".into()),
+        refused_generation: 2,
+        ..status.applied()
+    });
+    advance(&mut status, false, NOW + 30, &gateway, &store)
+        .await
+        .unwrap();
+    assert_eq!(
+        (status.phase.as_str(), status.reason.as_str()),
+        ("Blocked", "UpdateRejected")
     );
 }

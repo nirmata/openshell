@@ -105,6 +105,12 @@ spec:
                       - targetPort
                     type: object
                   type: array
+                stopped:
+                  description: |-
+                    Stop the sandbox, keeping its gateway record. Set it back to `false` to
+                    start a sandbox this controller stopped. The controller never starts a
+                    sandbox that someone else stopped.
+                  type: boolean
                 templateRef:
                   description: |-
                     The workload's template: an `OpenShellSandboxTemplate`, or else an
@@ -154,13 +160,41 @@ spec:
                   type: object
               type: object
               x-kubernetes-validations:
-                - message: spec is immutable; create a new Sandbox for a different workload
-                  rule: self == oldSelf
+                - message: templateRef, workload, command, restartPolicy, and serviceExposures can't change; create a new sandbox for a different workload
+                  rule: has(self.templateRef) == has(oldSelf.templateRef) && (!has(self.templateRef) || self.templateRef == oldSelf.templateRef) && has(self.workload) == has(oldSelf.workload) && (!has(self.workload) || self.workload == oldSelf.workload) && has(self.command) == has(oldSelf.command) && (!has(self.command) || self.command == oldSelf.command) && has(self.restartPolicy) == has(oldSelf.restartPolicy) && (!has(self.restartPolicy) || self.restartPolicy == oldSelf.restartPolicy) && has(self.serviceExposures) == has(oldSelf.serviceExposures) && (!has(self.serviceExposures) || self.serviceExposures == oldSelf.serviceExposures)
                 - message: set templateRef or workload, not both
                   rule: "!(has(self.templateRef) && has(self.workload))"
             status:
               nullable: true
               properties:
+                applied:
+                  description: Changes applied after creation. Absent until the first one.
+                  nullable: true
+                  properties:
+                    policy:
+                      description: The last policy applied, in the spec's format.
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    providers:
+                      default: []
+                      description: Providers attached to the sandbox.
+                      items:
+                        type: string
+                      type: array
+                    refused:
+                      description: Why the gateway refused a change, until the spec changes again.
+                      nullable: true
+                      type: string
+                    refusedGeneration:
+                      default: 0
+                      description: The spec generation that `refused` applies to.
+                      format: int64
+                      type: integer
+                    stopped:
+                      default: false
+                      description: True when this controller stopped the sandbox.
+                      type: boolean
+                  type: object
                 conditions:
                   default: []
                   items:

@@ -71,9 +71,24 @@ the same format as a policy file for `openshell sandbox create --policy`; the
 controller validates it before submission and blocks an invalid policy with
 reason `PolicyInvalid`. Without `policy`, the gateway's default policy applies.
 The controller records these inputs in the journal so a replayed create sends
-the original request. The entire sandbox spec is immutable through a CEL
-admission transition rule. Reapplying equivalent content is allowed. Change the workload by creating a
-new resource, not by updating an existing resource.
+the original request.
+
+A CEL admission rule keeps the startup fields from changing: `templateRef`,
+`workload`, `command`, `restartPolicy`, and `serviceExposures`. To run a
+different workload, create a new resource. These fields can change on a running
+sandbox:
+
+- `providers`: the controller attaches added providers and detaches removed
+  ones.
+- `policy`: the controller applies the new policy. The gateway accepts changes
+  to network and Cedar rules only; any other change blocks the sandbox with
+  reason `UpdateRejected` until you change the spec again. Removing `policy`
+  keeps the last policy applied.
+- `stopped`: `true` stops the sandbox and `false` starts it again. The
+  controller starts only a sandbox it stopped, so an operator's emergency stop
+  stays in place.
+
+`status.applied` records what the controller applied after creation.
 
 The trusted flags bind exactly one namespace to one gateway URL and workspace.
 Resources cannot override this mapping or supply credentials. Optional

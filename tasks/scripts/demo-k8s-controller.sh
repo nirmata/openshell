@@ -12,7 +12,8 @@
 #      confirm the controller reapplies the provider. Then measure the
 #      sandbox's etcd size and confirm a Ready sandbox causes no writes.
 #   2. Show the same sandbox through the gateway CLI and run a command in it.
-#   3. Reject a workload change (the workload template is immutable).
+#   3. Reject a workload change, then stop and start the sandbox and detach
+#      and reattach its provider in place.
 #   4. Change the template: it publishes a new revision, and the running
 #      sandbox stays on the revision it started with.
 #   5. Restart the controller and confirm it doesn't create a duplicate.
@@ -336,12 +337,40 @@ os policy get "${sandbox}" --workspace "${WORKSPACE}" --full 2>/dev/null | grep 
   || fail "the gateway sandbox doesn't have the declared policy"
 pass "the gateway sandbox has the policy declared in the resource"
 
-step "3. The workload template is immutable; changes are rejected at admission"
+step "3. The workload can't change in place; stopped and providers can"
 if kctl patch ossbx support-agent -n "${NAMESPACE}" --type=merge \
   -p '{"spec":{"templateRef":{"name":"something-else"}}}' 2>&1; then
   fail "API server accepted a workload template change"
 fi
 pass "workload change rejected; create a new resource to run a different workload"
+
+# Waits up to two minutes for a sandbox status field to reach a value.
+wait_sandbox() {
+  local path="$1" want="$2"
+  for _ in $(seq 120); do
+    [ "$(jp support-agent "${path}")" = "${want}" ] && return 0
+    sleep 1
+  done
+  fail "support-agent ${path} is $(jp support-agent "${path}"), not ${want}"
+}
+run kctl patch ossbx support-agent -n "${NAMESPACE}" --type=merge -p '{"spec":{"stopped":true}}'
+wait_sandbox '{.status.gatewayPhase}' Stopped
+[ "$(jp support-agent '{.status.phase}')" = Ready ] \
+  || fail "a stopped sandbox should stay Ready"
+run kctl patch ossbx support-agent -n "${NAMESPACE}" --type=merge -p '{"spec":{"stopped":false}}'
+wait_sandbox '{.status.gatewayPhase}' Ready
+pass "stopped and started in place; the resource stayed Ready"
+
+run kctl patch ossbx support-agent -n "${NAMESPACE}" --type=merge -p '{"spec":{"providers":[]}}'
+wait_sandbox '{.status.applied.providers}' '[]'
+attached="$(os sandbox provider list "${sandbox}" --workspace "${WORKSPACE}")"
+[[ "${attached}" != *"${PROVIDER}"* ]] || fail "provider ${PROVIDER} is still attached"
+run kctl patch ossbx support-agent -n "${NAMESPACE}" --type=merge \
+  -p "{\"spec\":{\"providers\":[\"${PROVIDER}\"]}}"
+wait_sandbox '{.status.applied.providers[0]}' "${PROVIDER}"
+attached="$(os sandbox provider list "${sandbox}" --workspace "${WORKSPACE}")"
+[[ "${attached}" == *"${PROVIDER}"* ]] || fail "provider ${PROVIDER} wasn't reattached"
+pass "provider detached and reattached without replacing the sandbox"
 
 step "4. Change the template; running sandboxes keep their revision"
 run kctl patch ossbxt "${TEMPLATE}" -n "${NAMESPACE}" --type=merge \

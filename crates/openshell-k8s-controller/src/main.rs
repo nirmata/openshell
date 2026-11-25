@@ -18,11 +18,11 @@ use kube_runtime::{
     watcher,
 };
 use openshell_k8s_controller::{
-    Binding, FINALIZER, Gateway, GatewayError, Missing, OpenShellSandbox, Outcome, Persistence,
-    PersistenceError, RemoteSandbox, RestartPolicy, SandboxInputs, SandboxStatus,
-    ServiceAuthorization, advance, crd_manifest,
+    ACTIVE_OBSERVATION_SECONDS, Binding, FINALIZER, Gateway, GatewayError, Missing,
+    OpenShellSandbox, Outcome, Persistence, PersistenceError, RemoteSandbox, RestartPolicy,
+    SandboxInputs, SandboxSpec, SandboxStatus, ServiceAuthorization, Update, advance, crd_manifest,
     leader::{Election, LeaseLost},
-    next_observation,
+    next_observation, pending_updates,
     provider::{
         self, Desired, OpenShellProvider, ProviderGateway, RefreshStrategy, SecretData,
         SecretReader, SecretsError, Step,
@@ -410,6 +410,97 @@ impl Gateway for RpcGateway {
             }
         })?;
         Ok(())
+    }
+
+    async fn update(
+        &self,
+        binding: &Binding,
+        update: &Update,
+        spec: &SandboxSpec,
+    ) -> Result<(), GatewayError> {
+        let scope = Some(proto::workspace_selector(&binding.workspace));
+        let sandbox = binding.sandbox_name.clone();
+        let mut grpc = self.grpc();
+        let call = async {
+            match update {
+                Update::Attach(provider) => grpc
+                    .attach_sandbox_provider(proto::AttachSandboxProviderRequest {
+                        workspace_scope: scope,
+                        sandbox,
+                        provider: provider.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(drop),
+                Update::Detach(provider) => grpc
+                    .detach_sandbox_provider(proto::DetachSandboxProviderRequest {
+                        workspace_scope: scope,
+                        sandbox,
+                        provider: provider.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(drop),
+                Update::Policy => {
+                    // `SandboxSpec::refusal` blocks an invalid policy first.
+                    let policy = spec.inputs.policy.as_ref().and_then(|policy| {
+                        openshell_policy::parse_sandbox_policy(&policy.to_string()).ok()
+                    });
+                    grpc.update_config(proto::UpdateConfigRequest {
+                        workspace_scope: scope,
+                        sandbox,
+                        policy,
+                        ..Default::default()
+                    })
+                    .await
+                    .map(drop)
+                }
+                Update::Stop => grpc
+                    .stop_sandbox(proto::StopSandboxRequest {
+                        workspace_scope: scope,
+                        name: sandbox,
+                        ..Default::default()
+                    })
+                    .await
+                    .map(drop),
+                Update::Start => grpc
+                    .start_sandbox(proto::StartSandboxRequest {
+                        workspace_scope: scope,
+                        name: sandbox,
+                        ..Default::default()
+                    })
+                    .await
+                    .map(drop),
+            }
+        };
+        match tokio::time::timeout(CALL_TIMEOUT, call).await {
+            Ok(Ok(())) => Ok(()),
+            // Repeating an attach or detach that already happened is success.
+            Ok(Err(status))
+                if matches!(
+                    (update, status.code()),
+                    (Update::Attach(_), tonic::Code::AlreadyExists)
+                        | (Update::Detach(_), tonic::Code::NotFound)
+                ) =>
+            {
+                Ok(())
+            }
+            Ok(Err(status)) if missing_provider(&status) => {
+                Err(GatewayError::Missing(Missing::Provider))
+            }
+            Ok(Err(status))
+                if matches!(
+                    status.code(),
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::PermissionDenied
+                ) =>
+            {
+                Err(GatewayError::Rejected)
+            }
+            // A timeout or any other failure may have applied; try again.
+            Ok(Err(_)) | Err(_) => Err(GatewayError::Uncertain),
+        }
     }
 }
 
@@ -912,6 +1003,16 @@ async fn reconcile(object: Arc<OpenShellSandbox>, context: Arc<Context>) -> Resu
     };
     let mut expected = binding;
     expected.create_started_at = status.journal.binding.create_started_at;
+    // Policy and providers can change after creation; the journal keeps the
+    // create inputs so a replayed create sends the original request.
+    expected
+        .inputs
+        .policy
+        .clone_from(&status.journal.binding.inputs.policy);
+    expected
+        .inputs
+        .providers
+        .clone_from(&status.journal.binding.inputs.providers);
     if status.journal.binding != expected {
         status.phase = "Blocked".into();
         status.reason = "BindingChanged".into();
@@ -930,9 +1031,15 @@ async fn reconcile(object: Arc<OpenShellSandbox>, context: Arc<Context>) -> Resu
         return Ok(Action::requeue(REFUSED_WAIT));
     }
     // Kubernetes can advance generation when deletion metadata changes. The
-    // immutable authored spec is checked against the journal above; generation
-    // alone must never prevent cleanup of an already accepted sandbox.
+    // startup fields are checked against the journal above; generation alone
+    // must never prevent cleanup of an already accepted sandbox.
     status.observed_generation = generation;
+    if let Some(applied) = status.applied.as_mut()
+        && applied.refused_generation != generation
+    {
+        // The spec changed since the gateway refused a change; try again.
+        applied.refused = None;
+    }
     store.save(&status).await?;
     if advance(&mut status, deleting, now, context.gateway.as_ref(), &store).await?
         == Outcome::Finalize
@@ -959,8 +1066,75 @@ async fn reconcile(object: Arc<OpenShellSandbox>, context: Arc<Context>) -> Resu
             .await?;
         return Ok(Action::await_change());
     }
+    if !deleting
+        && status.sandbox_id.is_some()
+        && apply_updates(&object.spec, &mut status, generation, &context).await
+    {
+        store.save(&status).await?;
+        return Ok(Action::requeue(Duration::from_secs(
+            ACTIVE_OBSERVATION_SECONDS.unsigned_abs(),
+        )));
+    }
     let delay = next_observation(&status, now, deleting);
     Ok(Action::requeue(Duration::from_secs(delay.unsigned_abs())))
+}
+
+/// Applies changes to policy, providers, and `stopped`. Returns true when
+/// status changed and the sandbox should be observed again soon.
+async fn apply_updates(
+    spec: &SandboxSpec,
+    status: &mut SandboxStatus,
+    generation: i64,
+    context: &Context,
+) -> bool {
+    let mut applied = status.applied();
+    if applied.refused.is_some() {
+        return false;
+    }
+    let phase = status.gateway_phase.clone().unwrap_or_default();
+    let updates = pending_updates(spec, status, &phase);
+    if updates.is_empty() {
+        return false;
+    }
+    for update in &updates {
+        match context
+            .gateway
+            .update(&status.journal.binding, update, spec)
+            .await
+        {
+            Ok(()) => match update {
+                Update::Attach(name) => applied.providers.push(name.clone()),
+                Update::Detach(name) => applied.providers.retain(|p| p != name),
+                Update::Policy => applied.policy.clone_from(&spec.inputs.policy),
+                Update::Stop => applied.stopped = true,
+                Update::Start => applied.stopped = false,
+            },
+            Err(GatewayError::Missing(missing)) => {
+                applied.refused = Some(missing_reason(missing).into());
+                break;
+            }
+            Err(GatewayError::Rejected | GatewayError::Collision) => {
+                applied.refused = Some("UpdateRejected".into());
+                break;
+            }
+            // Try again on the next reconcile.
+            Err(GatewayError::Uncertain) => break,
+        }
+    }
+    if let Some(reason) = &applied.refused {
+        applied.refused_generation = generation;
+        status.phase = "Blocked".into();
+        status.reason.clone_from(reason);
+    }
+    status.applied = Some(applied);
+    true
+}
+
+const fn missing_reason(missing: Missing) -> &'static str {
+    match missing {
+        Missing::Template => "TemplateNotFound",
+        Missing::Provider => "ProviderNotFound",
+    }
 }
 
 /// Delay before checking again for a template that isn't published yet.
@@ -1500,6 +1674,7 @@ mod tests {
                     namespace: None,
                 }),
                 inputs: SandboxInputs::default(),
+                stopped: false,
             },
         );
         object.metadata.uid = Some("fd229996-bc63-413e-9dc0-cc5f05abe5bd".into());

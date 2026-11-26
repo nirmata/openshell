@@ -33,7 +33,20 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      base: ${{ steps.base.outputs.commit }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The sandbox and supervisor images are upstream's for this commit.
+      - name: Find the upstream base commit
+        id: base
+        run: |
+          git fetch --quiet "${UPSTREAM}" main
+          echo "commit=$(git merge-base HEAD FETCH_HEAD)" >> "${GITHUB_OUTPUT}"
+
       - id: version
         env:
           INPUT: ${{ inputs.version }}
@@ -60,17 +73,29 @@ jobs:
     timeout-minutes: 90
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      BASE: ${{ needs.version.outputs.base }}
       ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # As upstream release builds do: embed the release version instead of
+      # one derived from git, and the supervisor image tag the gateway
+      # defaults to.
+      - name: Set the version
+        run: sed -i "s/^version = \"0\\.0\\.0\"$/version = \"${VERSION}\"/" Cargo.toml
+
       - name: Build the gateway and controller
+        env:
+          GIT_DIR: /nonexistent
+          OPENSHELL_IMAGE_TAG: ${{ needs.version.outputs.base }}
         run: |
           rustup show active-toolchain || rustup toolchain install
-          # The gateway links the policy prover's Z3, built from source.
-          cargo build --release --locked -p openshell-gateway -p openshell-k8s-controller \
+          # The gateway links the policy prover's Z3, built from source. Not
+          # --locked: the version change updates the workspace entries in
+          # Cargo.lock; dependencies stay at their locked versions.
+          cargo build --release -p openshell-gateway -p openshell-k8s-controller \
             --features openshell-gateway/vendored-z3
           install -d "deploy/docker/.build/prebuilt-binaries/${ARCH}"
           install -m 0755 target/release/openshell-gateway target/release/openshell-k8s-controller \
@@ -133,20 +158,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
 
-      - name: Find the upstream base commit
-        id: base
-        run: |
-          git fetch --quiet "${UPSTREAM}" main
-          echo "commit=$(git merge-base HEAD FETCH_HEAD)" >> "${GITHUB_OUTPUT}"
-
       - name: Package the charts
         env:
-          BASE: ${{ steps.base.outputs.commit }}
+          BASE: ${{ needs.version.outputs.base }}
         run: |
           gateway=deploy/helm/openshell
           controller=deploy/helm/openshell-k8s-controller

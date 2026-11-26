@@ -6,9 +6,8 @@
 # architecture and loads it into the local Docker image store as
 # openshell/$COMPONENT:$IMAGE_TAG.
 #
-# With cargo-zigbuild, it stages the controller binary the way release builds
-# do. Otherwise, and always for the gateway, which needs its own features, it
-# compiles the binary in a rust container, which needs no local
+# With cargo-zigbuild, it stages the binary the way release builds do.
+# Otherwise it compiles the binary in a rust container, which needs no local
 # cross-compiler, and packages it on the distroless cc base, because that
 # binary links libgcc_s dynamically.
 #
@@ -23,12 +22,10 @@ IMAGE_TAG="${IMAGE_TAG:-dev}"
 COMPONENT="${COMPONENT:-k8s-controller}"
 case "${COMPONENT}" in
   k8s-controller) BINARY=openshell-k8s-controller FEATURES="" SETUP=":" ;;
-  # The gateway includes only the Kubernetes compute driver, and links the
-  # policy prover's Z3, built from source as release builds do, which needs
-  # cmake.
+  # The gateway links the policy prover's Z3; build it from source, as
+  # release builds do, which needs cmake.
   gateway)
-    BINARY=openshell-gateway
-    FEATURES="--no-default-features --features telemetry,compute-driver-kubernetes,vendored-z3"
+    BINARY=openshell-gateway FEATURES="--features vendored-z3"
     SETUP="apt-get update -qq && apt-get install -y -qq cmake >/dev/null"
     ;;
   *) echo "unsupported COMPONENT: ${COMPONENT}" >&2; exit 1 ;;
@@ -46,7 +43,7 @@ BASE_ARGS=()
 if [ -n "${K8S_CONTROLLER_BINARY:-}" ]; then
   install -m 0755 "${K8S_CONTROLLER_BINARY}" "${STAGE}/${BINARY}"
   BASE_ARGS=(--build-arg "K8S_CONTROLLER_BASE_IMAGE=${CC_BASE}")
-elif [ "${COMPONENT}" = k8s-controller ] && command -v cargo-zigbuild >/dev/null 2>&1; then
+elif command -v cargo-zigbuild >/dev/null 2>&1; then
   PREBUILT_ARCH="${ARCH}" "${ROOT}/tasks/scripts/stage-prebuilt-binaries.sh" "${COMPONENT}"
 else
   BASE_ARGS=(--build-arg "K8S_CONTROLLER_BASE_IMAGE=${CC_BASE}")

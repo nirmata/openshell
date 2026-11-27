@@ -250,6 +250,15 @@ output="$(os sandbox exec "${NAME}" --workspace "${NAMESPACE}" --no-tty -- echo 
 [ "${output}" = "hello from ${NAME}" ] || fail "sandbox exec returned: ${output}"
 pass "sandbox ${NAME} is Ready, runs as pods in namespace openshell, and runs commands"
 
+run kubectl -n "${NAMESPACE}" patch ossbx support-agent --type=merge -p '{"spec":{"stopped":true}}'
+run kubectl wait --for=jsonpath='{.status.gatewayPhase}'=Stopped ossbx/support-agent -n "${NAMESPACE}" --timeout=180s
+run kubectl -n "${NAMESPACE}" patch ossbx support-agent --type=merge -p '{"spec":{"stopped":false}}'
+run kubectl wait --for=jsonpath='{.status.gatewayPhase}'=Ready ossbx/support-agent -n "${NAMESPACE}" --timeout=400s
+run kubectl wait --for=condition=Ready ossbx/support-agent -n "${NAMESPACE}" --timeout=120s
+output="$(os sandbox exec "${NAME}" --workspace "${NAMESPACE}" --no-tty -- echo restarted)"
+[ "${output}" = "restarted" ] || fail "sandbox exec after restart returned: ${output}"
+pass "stopping and starting the sandbox through spec.stopped works"
+
 step "5. Check that NetworkPolicy is enforced"
 run kubectl -n openshell get networkpolicy
 workload="$(kubectl -n openshell get pod -l openshell.ai/boundary-role=workload -o jsonpath='{.items[0].metadata.name}')"

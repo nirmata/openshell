@@ -25,6 +25,8 @@ helm install openshell-controller oci://ghcr.io/nirmata/charts/openshell-k8s-con
   --set gateway.tls.secretName=openshell-controller-tls
 ```
 
+[nirmata/runbook.md](nirmata/runbook.md) is the runbook to share with
+operators.
 [examples/kubernetes-sandbox-crd](examples/kubernetes-sandbox-crd/README.md)
 walks through the whole setup, and
 [deploy/helm/openshell-k8s-controller](deploy/helm/openshell-k8s-controller/README.md)

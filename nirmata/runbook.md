@@ -119,28 +119,12 @@ the controller is running.
 
 ## Declare a sandbox
 
-A provider supplies credentials, a template supplies the image and
-environment, and a sandbox uses both. The gateway needs the GitHub provider
-profile before it accepts a `github` provider, so import it first:
+A template supplies the image and environment, and a sandbox runs it. A
+sandbox needs no credentials; to add them, see
+[Give a sandbox credentials](#optional-give-a-sandbox-credentials).
 
 ```shell
-curl -fsSLO "https://raw.githubusercontent.com/nirmata/openshell/v$VERSION/providers/github.yaml"
-openshell -g k8s provider profile import -f github.yaml --workspace agents
-kubectl -n agents create secret generic github-token --from-literal=token=YOUR_TOKEN
 kubectl apply -f - <<'EOF'
-apiVersion: openshell.ai/v1alpha1
-kind: OpenShellProvider
-metadata:
-  name: github
-  namespace: agents
-spec:
-  type: github
-  credentials:
-    - name: GITHUB_TOKEN
-      secretKeyRef:
-        name: github-token
-        key: token
----
 apiVersion: openshell.ai/v1alpha1
 kind: OpenShellSandboxTemplate
 metadata:
@@ -159,16 +143,11 @@ metadata:
 spec:
   templateRef:
     name: demo-agent
-  providers: [github]
 EOF
-kubectl -n agents wait --for=condition=Ready osprov/github ossbxt/demo-agent --timeout=120s
+kubectl -n agents wait --for=condition=Ready ossbxt/demo-agent --timeout=120s
 kubectl -n agents wait --for=condition=Ready ossbx/support-agent --timeout=400s
-kubectl -n agents get osprov,ossbxt,ossbx
+kubectl -n agents get ossbxt,ossbx
 ```
-
-The token stays in the Kubernetes Secret; no resource's spec or status
-contains it. The controller sends it to the gateway, which stores it and adds
-it to the sandbox's outbound requests.
 
 Run a command in the sandbox:
 
@@ -176,6 +155,44 @@ Run a command in the sandbox:
 NAME=$(kubectl -n agents get ossbx support-agent -o jsonpath='{.status.sandboxName}')
 openshell -g k8s sandbox exec "$NAME" --workspace agents --no-tty -- echo hello
 ```
+
+## Optional: Give a sandbox credentials
+
+Skip this section unless your agent calls an external service, such as
+GitHub. A provider supplies the credentials without exposing them to the
+agent. The token stays in a Kubernetes Secret, and no resource's spec or
+status contains it. The controller sends it to the gateway, which stores it
+and adds it to the sandbox's outbound requests to that service.
+
+The gateway needs the GitHub provider profile before it accepts a `github`
+provider, so import it first. Then create the Secret and the provider, and
+attach the provider to the running sandbox:
+
+```shell
+curl -fsSLO "https://raw.githubusercontent.com/nirmata/openshell/v$VERSION/providers/github.yaml"
+openshell -g k8s provider profile import -f github.yaml --workspace agents
+kubectl -n agents create secret generic github-token --from-literal=token=YOUR_TOKEN
+kubectl apply -f - <<'EOF'
+apiVersion: openshell.ai/v1alpha1
+kind: OpenShellProvider
+metadata:
+  name: github
+  namespace: agents
+spec:
+  type: github
+  credentials:
+    - name: GITHUB_TOKEN
+      secretKeyRef:
+        name: github-token
+        key: token
+EOF
+kubectl -n agents wait --for=condition=Ready osprov/github --timeout=120s
+kubectl -n agents patch ossbx support-agent --type=merge -p '{"spec":{"providers":["github"]}}'
+kubectl -n agents wait --for=jsonpath='{.status.applied.providers[0]}'=github ossbx/support-agent --timeout=120s
+```
+
+To attach the provider when you create a sandbox, add `providers: [github]`
+to its spec instead.
 
 ## Change a sandbox
 

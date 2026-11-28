@@ -239,7 +239,6 @@ metadata:
 spec:
   templateRef:
     name: demo-agent
-  providers: [github]
 YAML
 run kubectl wait --for=condition=Ready osprov/github ossbxt/demo-agent -n "${NAMESPACE}" --timeout=120s
 run kubectl wait --for=condition=Ready ossbx/support-agent -n "${NAMESPACE}" --timeout=400s
@@ -248,7 +247,13 @@ NAME="$(kubectl get ossbx support-agent -n "${NAMESPACE}" -o jsonpath='{.status.
 run kubectl get pods -n openshell
 output="$(os sandbox exec "${NAME}" --workspace "${NAMESPACE}" --no-tty -- echo "hello from ${NAME}")"
 [ "${output}" = "hello from ${NAME}" ] || fail "sandbox exec returned: ${output}"
-pass "sandbox ${NAME} is Ready, runs as pods in namespace openshell, and runs commands"
+pass "sandbox ${NAME} is Ready without a provider, runs as pods in namespace openshell, and runs commands"
+
+# As the team runbook does: attach the provider to the running sandbox.
+run kubectl -n "${NAMESPACE}" patch ossbx support-agent --type=merge -p '{"spec":{"providers":["github"]}}'
+run kubectl wait --for=jsonpath='{.status.applied.providers[0]}'=github ossbx/support-agent -n "${NAMESPACE}" --timeout=120s
+run kubectl wait --for=condition=Ready ossbx/support-agent -n "${NAMESPACE}" --timeout=120s
+pass "provider github is attached to the running sandbox"
 
 run kubectl -n "${NAMESPACE}" patch ossbx support-agent --type=merge -p '{"spec":{"stopped":true}}'
 run kubectl wait --for=jsonpath='{.status.gatewayPhase}'=Stopped ossbx/support-agent -n "${NAMESPACE}" --timeout=180s
